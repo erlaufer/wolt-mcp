@@ -119,13 +119,13 @@ const errText = (msg) => ({ content: [{ type: "text", text: msg }], isError: tru
 // reporting a stale one (test/version.test.mjs keeps manifest.json in step).
 const { version: VERSION } = createRequire(import.meta.url)("./package.json");
 const server = new McpServer({ name: "wolt-mcp", version: VERSION }, {
-  instructions: "When the user wants to BUY something (not just browse), call wolt_status FIRST — it live-verifies the Wolt login. If it reports loginNeeded, sort the login out with the user (login_via_chrome, or set_wolt_token on Firefox/Safari) before searching and planning, so the work isn't lost to an expired session mid-checkout. Searching and browsing venues never need a login. Baskets are single-venue: source every item from one store."
+  instructions: "When the user wants to BUY something (not just browse), call wolt_status FIRST — it live-verifies the Wolt login. If it reports loginNeeded, sort the login out with the user (login_via_chrome, or set_wolt_token on Firefox/Safari) before searching and planning, so the work isn't lost to an expired session mid-checkout. Searching and browsing venues never need a login. For the delivery address: use_saved_address pulls the user's saved Wolt addresses and sets one as the search location (get_wolt_profile does NOT have addresses); a spoken address goes through resolve_address + set_location. Baskets are single-venue: source every item from one store — plan_cart with venue_slug resolves a whole ingredient list there in one call."
 });
 
 // --- search_products: one ingredient -> candidate products (no auth) ---
 server.tool(
   "search_products",
-  "Search Wolt grocery products for a single ingredient near a location. Returns candidates across nearby stores with itemId, name, price (minor units), venueId, venueName, whether it's sold by weight, and unit size. Call once per ingredient, then pick the best match yourself. A basket must be all from ONE venueId. MATCHING RULES when picking: (1) Match the ingredient ITSELF — never a plant-based, vegan, imitation, or flavored substitute unless the user explicitly asked. e.g. 'Redefine Meat'/'plant-based mince' is NOT ground beef; margarine is NOT butter; imitation crab is NOT crab. (2) Do NOT just pick the cheapest — Wolt surfaces cheap 'Substitute Deals' that are often imitation products; prefer the real, mainstream item at a sensible package size. (3) Match the right FORM (crushed tomatoes ≠ tomato paste; ground beef ≠ beef sausage). When unsure, prefer the plainest real version of the actual ingredient.",
+  "Search Wolt grocery products for a single ingredient near a location. Returns candidates across nearby stores with itemId, name, price (minor units), venueId, venueName, whether it's sold by weight, and unit size. Call once per ingredient, then pick the best match yourself. For a whole recipe or shopping list, prefer plan_cart (pinned to a venue_slug) — it resolves every ingredient in one call. A basket must be all from ONE venueId. MATCHING RULES when picking: (1) Match the ingredient ITSELF — never a plant-based, vegan, imitation, or flavored substitute unless the user explicitly asked. e.g. 'Redefine Meat'/'plant-based mince' is NOT ground beef; margarine is NOT butter; imitation crab is NOT crab. (2) Do NOT just pick the cheapest — Wolt surfaces cheap 'Substitute Deals' that are often imitation products; prefer the real, mainstream item at a sensible package size. (3) Match the right FORM (crushed tomatoes ≠ tomato paste; ground beef ≠ beef sausage). When unsure, prefer the plainest real version of the actual ingredient.",
   {
     query: z.string().describe("Product search term, e.g. 'crushed tomatoes'"),
     lat: z.number().optional().describe("Override latitude; defaults to the saved location"),
@@ -238,8 +238,11 @@ server.tool(
               try { hits = await searchVenueItems(venue_slug, longest); } catch (e) {}
             }
           }
+          // Only accept scored matches — the raw first hit of a missed query
+          // is garbage (a "shrimp" miss once returned Sprite Zero). A miss
+          // belongs in `missing`, where the model can rephrase it.
           const ranked = rankCandidates(name, hits, { topK: 3, minScore: 0.15 });
-          const best = ranked[0] || hits[0];
+          const best = ranked[0];
           if (best) {
             lineItems.push({
               ingredient: raw, name: best.name, itemId: best.itemId, price: best.price,
@@ -284,7 +287,7 @@ server.tool(
 // --- add_to_cart: write the basket (needs WOLT_BEARER_TOKEN) ---
 server.tool(
   "add_to_cart",
-  "Write items to the user's Wolt basket for one venue. All items must share the venue_id. Needs a valid Wolt bearer token (WOLT_BEARER_TOKEN). After success, the user opens Wolt to review and check out — nothing is ordered automatically.",
+  "Write items to the user's Wolt basket for one venue. All items must share the venue_id. Needs login (if wolt_status says loginNeeded, do that first). Returns a checkoutUrl — give it to the user, and call checkout_preview for the real total including fees. Nothing is ever ordered automatically; the user reviews and pays on wolt.com.",
   {
     venue_id: z.string(),
     venue_slug: z.string().optional().describe("venueSlug from search results — used to build the checkout link"),
@@ -732,7 +735,7 @@ server.tool(
 // --- login_via_chrome: zero-paste login by watching a Chrome you launch ---
 server.tool(
   "login_via_chrome",
-  "Zero-paste Wolt login: launches a Chromium-based browser with wolt.com open; the user logs in normally and the refresh token is picked up automatically and exchanged for an API token. Tell the user two things: (1) a browser window will open in a SEPARATE, EMPTY profile, so they log into Wolt fresh there — their everyday profile, cookies and extensions are untouched; (2) this tool waits up to 2 minutes — if it times out the window stays open, so if they need longer (waiting on an emailed code), let them finish signing in there and call this again. Requires Chrome, Edge, Brave, Vivaldi or Chromium (it uses the Chrome DevTools Protocol, so Firefox and Safari cannot work); Chrome is auto-detected, other browsers need the CHROME_BIN env var. If the user has no Chromium-based browser, use set_wolt_token instead.",
+  "Zero-paste Wolt login: launches a Chromium-based browser with wolt.com open; the user logs in normally and the refresh token is picked up automatically and exchanged for an API token. Tell the user two things: (1) a browser window will open in a SEPARATE, EMPTY profile, so they log into Wolt fresh there — their everyday profile, cookies and extensions are untouched; (2) this tool waits up to 2 minutes — if it times out the window stays open, so if they need longer (waiting on an emailed code), let them finish signing in there and call this again. Requires a Chromium-family browser — the user's default browser is auto-detected and used when it's Chrome, Edge, Brave, Vivaldi, Arc or Chromium (CDP-based, so Firefox and Safari cannot work; use set_wolt_token there instead). CHROME_BIN overrides the choice if needed. After a successful login, call use_saved_address so searches use the user's real address.",
   {},
   async () => {
     try {
@@ -769,7 +772,7 @@ server.tool(
 // --- get_wolt_profile: authenticated user info (may include saved addresses) ---
 server.tool(
   "get_wolt_profile",
-  "Fetch the logged-in user's Wolt profile (GET /v1/user/me; needs a token). If the response includes saved delivery addresses/locations, offer to save one as the default via set_location.",
+  "Fetch the logged-in user's Wolt profile — name/email/phone only (GET /v1/user/me; needs a token). It does NOT contain delivery addresses: to pull the user's saved addresses and set one as the search location, call use_saved_address instead.",
   async () => {
     try {
       const r = await woltFetch("https://restaurant-api.wolt.com/v1/user/me");
@@ -784,7 +787,7 @@ server.tool(
 // --- set_location: persist the delivery location ---
 server.tool(
   "set_location",
-  "Save the user's delivery location (persisted; used as the default for all searches). When the user gives an address or city, resolve it to coordinates yourself and pass them here with the human-readable text as label.",
+  "Save the user's delivery location (persisted; used as the default for all searches). When the user gives an address or city, geocode it with resolve_address first and pass the coordinates here with the human-readable text as label. For their saved Wolt addresses, use use_saved_address instead.",
   {
     lat: z.number().describe("Latitude"),
     lon: z.number().describe("Longitude"),
@@ -807,7 +810,7 @@ server.tool(
       loginNeeded,
       ...(loginDetail ? { loginDetail } : {}),
       ...describeTokens(),
-      location: getLocation() || { label: "not set (estimated from IP on first search)" }
+      location: getLocation() || { label: "not set (estimated from IP on first search)", hint: "use_saved_address sets it from the user's saved Wolt addresses; set_location takes a spoken address" }
     });
   }
 );

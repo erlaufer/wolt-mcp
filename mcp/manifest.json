@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "wolt-mcp",
   "display_name": "Wolt MCP",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Shop Wolt from Claude: search nearby stores, plan a single-store cart, and fill your Wolt basket. You review and check out on Wolt yourself.",
   "long_description": "Tell Claude what you want to buy — a shopping list, a recipe, or just 'I need a shovel' — and it searches Wolt stores near you, picks the best products, and writes them to your Wolt basket. Nothing is ever ordered automatically: you open Wolt to review and check out. Runs entirely on your machine; your Wolt token never leaves it. If no delivery location is set, it makes a single city-level IP lookup to find stores near you — telling Claude your address or using your saved Wolt address overrides that.\n\nTo connect: install, then ask Claude \"Connect my Wolt account\". A browser window opens on wolt.com in a separate, empty profile — log in there and you're done. This uses your default browser when it's Chromium-based (Chrome, Edge, Brave, Vivaldi, Arc or Chromium — the window opens in a separate, empty profile by design) and needs Node 22+; on Firefox/Safari or older Node, paste a refresh token instead. Searching stores needs no login at all — only writing your basket does.",
   "author": { "name": "erlaufer" },

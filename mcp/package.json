@@ -1,6 +1,6 @@
 {
   "name": "wolt-mcp",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "MCP server for Wolt shopping: search grocery products near you, plan a single-store cart, and write it to your Wolt basket. Your MCP client's model does the reasoning — no API key needed here.",
   "type": "module",
   "license": "MIT",

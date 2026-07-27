@@ -26,8 +26,12 @@ const IP_ESTIMATE_TTL_MS = 24 * 60 * 60 * 1000;
 export function getLocation() {
   const cfg = load();
   if (cfg.location?.lat != null && cfg.location?.lon != null) return cfg.location;
-  if (process.env.WOLT_LAT && process.env.WOLT_LON) {
-    return { lat: Number(process.env.WOLT_LAT), lon: Number(process.env.WOLT_LON), label: "from env" };
+  // The .mcpb host substitutes unset user_config as junk strings, so the env
+  // seeds only count when they parse to real coordinates — otherwise searches
+  // run on lat=NaN and silently return nothing.
+  const envLat = Number(process.env.WOLT_LAT), envLon = Number(process.env.WOLT_LON);
+  if (process.env.WOLT_LAT && process.env.WOLT_LON && Number.isFinite(envLat) && Number.isFinite(envLon)) {
+    return { lat: envLat, lon: envLon, label: "from env" };
   }
   const est = cfg.ipEstimate;
   if (est?.lat != null && est?.lon != null && Date.now() - (est.at || 0) < IP_ESTIMATE_TTL_MS) {
