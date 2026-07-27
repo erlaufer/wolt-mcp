@@ -21,7 +21,7 @@ import {
 import { woltFetch } from "./lib/http.js";
 import { rankCandidates } from "./lib/match.js";
 import { parseIngredientLine } from "./lib/recipe.js";
-import { setTokens, describeTokens } from "./lib/auth.js";
+import { setTokens, describeTokens, getAccessToken } from "./lib/auth.js";
 import { getLocation, setLocation, estimateLocation } from "./lib/config.js";
 import { checkoutPreview } from "./lib/checkout.js";
 import { cdpLogin } from "./lib/cdp-login.js";
@@ -118,7 +118,9 @@ const errText = (msg) => ({ content: [{ type: "text", text: msg }], isError: tru
 // Version comes from package.json so a release bump can't leave the server
 // reporting a stale one (test/version.test.mjs keeps manifest.json in step).
 const { version: VERSION } = createRequire(import.meta.url)("./package.json");
-const server = new McpServer({ name: "wolt-mcp", version: VERSION });
+const server = new McpServer({ name: "wolt-mcp", version: VERSION }, {
+  instructions: "When the user wants to BUY something (not just browse), call wolt_status FIRST — it live-verifies the Wolt login. If it reports loginNeeded, sort the login out with the user (login_via_chrome, or set_wolt_token on Firefox/Safari) before searching and planning, so the work isn't lost to an expired session mid-checkout. Searching and browsing venues never need a login. Baskets are single-venue: source every item from one store."
+});
 
 // --- search_products: one ingredient -> candidate products (no auth) ---
 server.tool(
@@ -757,11 +759,23 @@ server.tool(
   async ({ lat, lon, label }) => text({ saved: setLocation({ lat, lon, label }) })
 );
 
-// --- wolt_status: token presence + validity ---
+// --- wolt_status: live login check + location ---
 server.tool(
   "wolt_status",
-  "Report Wolt token state (stored? minutes left? auto-refresh enabled?) and the configured location. Search works without a token; the cart write needs one.",
-  async () => text({ ...describeTokens(), location: getLocation() || { label: "not set (estimated from IP on first search)" } })
+  "Call this FIRST whenever the user wants to buy or manage their account: it live-verifies the Wolt login (refreshing the access token if needed) and reports the configured location. If loginNeeded is true, offer login_via_chrome (or set_wolt_token) before planning a cart. Search works without a token.",
+  async () => {
+    // Actually exercise the token chain instead of reporting what's on disk —
+    // a stored refresh token can be stale, and finding that out here beats
+    // finding out after the cart is planned.
+    let loginNeeded = false, loginDetail = null;
+    try { await getAccessToken(); } catch (e) { loginNeeded = true; loginDetail = e.message; }
+    return text({
+      loginNeeded,
+      ...(loginDetail ? { loginDetail } : {}),
+      ...describeTokens(),
+      location: getLocation() || { label: "not set (estimated from IP on first search)" }
+    });
+  }
 );
 
 await server.connect(new StdioServerTransport());

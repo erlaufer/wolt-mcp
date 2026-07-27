@@ -7,7 +7,8 @@
 // Bearer (confirmed live) — only the __wrtoken refresh cookie is useful here.
 // We store it and immediately exchange it via wauth2 for a real access JWT,
 // which also validates the harvest end-to-end.
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { setTokens, refreshAccessToken, describeTokens, snapshotTokens, restoreTokens } from "./auth.js";
@@ -15,11 +16,78 @@ import { setTokens, refreshAccessToken, describeTokens, snapshotTokens, restoreT
 const DEBUG_URL = process.env.WOLT_CHROME_DEBUG_URL || "http://127.0.0.1:9223";
 const LOGIN_URL = "https://wolt.com/login";
 const PROFILE_DIR = join(process.env.WOLT_STATE_DIR || join(homedir(), ".wolt-mcp"), "chrome-profile");
-const CHROME_BIN = process.env.CHROME_BIN || (
-  process.platform === "darwin" ? "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-  : process.platform === "win32" ? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-  : "google-chrome"
-);
+// Chromium-family browsers we can drive over CDP, keyed by the identifiers the
+// OS default-browser registries use (macOS bundle ids, Windows ProgIds, Linux
+// .desktop names). Firefox/Safari never appear here — they have no CDP, and
+// set_wolt_token is the documented path for them.
+const CHROMIUM_APPS = {
+  darwin: [
+    { ids: ["com.google.chrome"], bins: ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"] },
+    { ids: ["com.microsoft.edgemac"], bins: ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"] },
+    { ids: ["com.brave.browser"], bins: ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"] },
+    { ids: ["com.vivaldi.vivaldi"], bins: ["/Applications/Vivaldi.app/Contents/MacOS/Vivaldi"] },
+    { ids: ["company.thebrowser.browser"], bins: ["/Applications/Arc.app/Contents/MacOS/Arc"] },
+    { ids: ["org.chromium.chromium"], bins: ["/Applications/Chromium.app/Contents/MacOS/Chromium"] }
+  ],
+  win32: [
+    { ids: ["chromehtml"], bins: [
+      "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+      "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+      join(process.env.LOCALAPPDATA || "", "Google\\Chrome\\Application\\chrome.exe")
+    ] },
+    { ids: ["msedgehtm"], bins: [
+      "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+      "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe"
+    ] },
+    { ids: ["bravehtml"], bins: ["C:\\Program Files\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"] },
+    { ids: ["vivaldihtm", "vivaldi.htm"], bins: [join(process.env.LOCALAPPDATA || "", "Vivaldi\\Application\\vivaldi.exe")] }
+  ],
+  linux: [
+    { ids: ["google-chrome", "google-chrome-stable"], bins: ["google-chrome", "google-chrome-stable"] },
+    { ids: ["microsoft-edge"], bins: ["microsoft-edge"] },
+    { ids: ["brave-browser", "brave_browser"], bins: ["brave-browser"] },
+    { ids: ["vivaldi", "vivaldi-stable"], bins: ["vivaldi"] },
+    { ids: ["chromium", "chromium-browser", "chromium_chromium"], bins: ["chromium", "chromium-browser"] }
+  ]
+};
+
+// The OS's default handler for https links, lowercased, or null. Best-effort:
+// any failure here just means "no preference detected" and the scan below runs.
+function defaultBrowserId() {
+  try {
+    if (process.platform === "darwin") {
+      const plist = join(homedir(), "Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist");
+      const raw = execFileSync("plutil", ["-convert", "json", "-o", "-", plist], { encoding: "utf8" });
+      const handlers = JSON.parse(raw).LSHandlers || [];
+      const h = handlers.find((x) => x.LSHandlerURLScheme === "https") || handlers.find((x) => x.LSHandlerURLScheme === "http");
+      return (h?.LSHandlerRoleAll || h?.LSHandlerRoleViewer || "").toLowerCase() || null;
+    }
+    if (process.platform === "win32") {
+      const out = execFileSync("reg", ["query", "HKCU\\Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\https\\UserChoice", "/v", "ProgId"], { encoding: "utf8" });
+      return out.match(/ProgId\s+REG_SZ\s+(\S+)/)?.[1]?.toLowerCase() || null;
+    }
+    return execFileSync("xdg-settings", ["get", "default-web-browser"], { encoding: "utf8" }).trim().replace(/\.desktop$/, "").toLowerCase() || null;
+  } catch (e) { return null; }
+}
+
+function firstUsableBin(app) {
+  for (const bin of app.bins) {
+    if (bin.includes("/") || bin.includes("\\")) { if (existsSync(bin)) return bin; continue; }
+    try { execFileSync("which", [bin], { stdio: "ignore" }); return bin; } catch (e) {}
+  }
+  return null;
+}
+
+// CHROME_BIN always wins. Otherwise prefer the user's default browser when it's
+// Chromium-family, then fall back to the first Chromium-family browser found.
+export function resolveChromeBin() {
+  if (process.env.CHROME_BIN) return process.env.CHROME_BIN;
+  const apps = CHROMIUM_APPS[process.platform] || CHROMIUM_APPS.linux;
+  const def = defaultBrowserId();
+  const preferred = def && apps.find((a) => a.ids.some((id) => def === id || def.includes(id)));
+  const bin = (preferred && firstUsableBin(preferred)) || apps.map(firstUsableBin).find(Boolean);
+  return bin || apps[0].bins[0];
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -36,7 +104,8 @@ async function fetchJson(url) {
 async function ensureChrome() {
   if (await fetchJson(`${DEBUG_URL}/json/version`)) return { launched: false };
   const port = new URL(DEBUG_URL).port;
-  const child = spawn(CHROME_BIN, [
+  const bin = resolveChromeBin();
+  const child = spawn(bin, [
     `--user-data-dir=${PROFILE_DIR}`,
     `--remote-debugging-port=${port}`,
     "--remote-debugging-address=127.0.0.1",
@@ -53,7 +122,7 @@ async function ensureChrome() {
   // that comes up a moment later is orphaned with its debug port open — and
   // the next attempt would attach to it (launched:false) and never close it.
   await closeLoginBrowser(true, child);
-  throw new Error(`The browser did not expose the debug port at ${DEBUG_URL}. Is a Chromium-based browser installed at ${CHROME_BIN}? Set CHROME_BIN to point at Chrome, Edge, Brave, Vivaldi or Chromium. (Firefox and Safari do not support the DevTools Protocol — use set_wolt_token instead.)`);
+  throw new Error(`The browser did not expose the debug port at ${DEBUG_URL}. Tried to launch "${bin}" — is a Chromium-based browser installed? Set CHROME_BIN to point at Chrome, Edge, Brave, Vivaldi, Arc or Chromium. (Firefox and Safari do not support the DevTools Protocol — use set_wolt_token instead.)`);
 }
 
 // One CDP round-trip over WebSocket (Node >= 22 has a global WebSocket).
