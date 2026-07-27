@@ -19,13 +19,13 @@ import {
   BASKETS_PAGE_URL, BASKETS_DELETE_URL, isVenueObjectId, findBasketForVenue, mergeBasketItems
 } from "./lib/wolt.js";
 import { woltFetch } from "./lib/http.js";
-import { rankCandidates } from "./lib/match.js";
+import { rankCandidates, tokens } from "./lib/match.js";
 import { parseIngredientLine } from "./lib/recipe.js";
 import { setTokens, describeTokens, getAccessToken } from "./lib/auth.js";
 import { getLocation, setLocation, estimateLocation } from "./lib/config.js";
 import { checkoutPreview } from "./lib/checkout.js";
 import { cdpLogin } from "./lib/cdp-login.js";
-import { getVenue, getMenu, getItemOptions, getCategories, resolveItem, parseItemUrl } from "./lib/venue.js";
+import { getVenue, getMenu, getItemOptions, getCategories, resolveItem, parseItemUrl, searchVenueItems } from "./lib/venue.js";
 import { getOrderHistory, getOrder, geocodeAddress } from "./lib/account.js";
 
 // Resolve coordinates for a tool call: explicit args win, then the saved/env
@@ -215,14 +215,48 @@ server.tool(
 // --- plan_cart: convenience one-shot (heuristic matching + store selection) ---
 server.tool(
   "plan_cart",
-  "One-shot convenience: given a list of ingredient lines, search each, pick the single store with best coverage (heuristic), and return a ready-to-write plan (venue + line items + basket). Prefer search_products + your own matching for better quality; use this for a quick pass.",
+  "Resolve a whole ingredient list in ONE call. With venue_slug: every ingredient is matched against that store's catalog (needs login) — the cheap way to build a full single-store cart; write ingredient lines in the store's own language for best matches. Without venue_slug: searches globally and picks the store with best coverage (heuristic, no login) — good for a first pass, then re-run pinned to the store you settle on. Returns line items + a ready add_to_cart basket; sanity-check the matches before writing.",
   {
-    ingredients: z.array(z.string()).describe("Ingredient lines, e.g. ['800 g crushed tomatoes', '1 onion']"),
+    ingredients: z.array(z.string()).describe("Ingredient lines, e.g. ['800 g crushed tomatoes', '1 onion'] — use the store's catalog language (e.g. Hebrew for Israeli stores)"),
+    venue_slug: z.string().optional().describe("Pin planning to this store instead of auto-picking; resolves every ingredient in-venue in one call"),
     lat: z.number().optional().describe("Override latitude; defaults to the saved location"),
     lon: z.number().optional().describe("Override longitude; defaults to the saved location")
   },
-  async ({ ingredients, lat, lon }) => {
+  async ({ ingredients, venue_slug, lat, lon }) => {
     try {
+      if (venue_slug) {
+        const venue = await getVenue(venue_slug);
+        const lineItems = [], missing = [];
+        for (const raw of ingredients) {
+          const name = parseIngredientLine(raw).name;
+          let hits = [];
+          try { hits = await searchVenueItems(venue_slug, name); } catch (e) {}
+          // Multi-word queries often miss; the store search wants short terms.
+          if (!hits.length) {
+            const longest = tokens(name).sort((a, b) => b.length - a.length)[0];
+            if (longest && longest !== name) {
+              try { hits = await searchVenueItems(venue_slug, longest); } catch (e) {}
+            }
+          }
+          const ranked = rankCandidates(name, hits, { topK: 3, minScore: 0.15 });
+          const best = ranked[0] || hits[0];
+          if (best) {
+            lineItems.push({
+              ingredient: raw, name: best.name, itemId: best.itemId, price: best.price,
+              alternatives: ranked.slice(1).map((c) => ({ name: c.name, itemId: c.itemId, price: c.price }))
+            });
+          } else missing.push(raw);
+        }
+        const basket = lineItems.length
+          ? buildBasketBody(lineItems.map((li) => ({ candidate: { itemId: li.itemId, name: li.name, price: li.price, isWeighted: false }, count: 1 })), venue.venueId, venue.currency || "EUR")
+          : null;
+        return text({
+          venue: { venueId: venue.venueId, slug: venue_slug, name: venue.name, currency: venue.currency },
+          coverage: `${lineItems.length}/${ingredients.length}`,
+          lineItems, missing, basket,
+          ...(missing.length ? { note: "Missing items may just be a language/phrasing miss — retry them in the store's catalog language, or drop them." } : {})
+        });
+      }
       ({ lat, lon } = await needLocation(lat, lon));
       const perIngredient = [];
       for (const raw of ingredients) {

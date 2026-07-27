@@ -10,6 +10,7 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { woltFetch } from "./http.js";
+import { rankCandidates } from "./match.js";
 
 const VENUE_STATIC_BASE = "https://consumer-api.wolt.com/order-xp/web/v1/pages/venue/slug/";
 const ASSORTMENT_BASE = "https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/";
@@ -103,7 +104,17 @@ export async function resolveItem(slug, ref) {
   if (!q) throw new Error("provide an item id, item URL, or name");
   const exact = items.filter((it) => (it.name || "").toLowerCase() === q);
   const matches = exact.length ? exact : items.filter((it) => (it.name || "").toLowerCase().includes(q));
-  if (!matches.length) throw new Error(`no item matching "${ref}" in "${venueSlug}"`);
+  if (!matches.length) {
+    // Descriptive names ("fresh chicken breast fillet") rarely substring-match
+    // a catalog. Fall back to token scoring and hand back the best candidates
+    // so the caller can pick by id instead of guessing new phrasings.
+    const fuzzy = rankCandidates(q, items, { topK: 5, minScore: 0.3 });
+    if (fuzzy.length) {
+      const top = fuzzy.map((m) => `${m.name} (${m.itemId})`).join("; ");
+      throw new Error(`no exact item matching "${ref}" in "${venueSlug}" — closest: ${top}. Pass one of these ids to pick it.`);
+    }
+    throw new Error(`no item matching "${ref}" in "${venueSlug}" (tip: query in the store's own language — catalogs are indexed in it)`);
+  }
   if (matches.length > 1) {
     const top = matches.slice(0, 5).map((m) => `${m.name} (${m.itemId})`).join("; ");
     throw new Error(`matched ${matches.length} items in "${venueSlug}" — be more specific or pass an item id. Top: ${top}`);
@@ -165,6 +176,13 @@ async function searchAssortmentItems(slug, query) {
   return r.json?.items || [];
 }
 
+// Lean in-venue search for batch flows: just the matching items, no category
+// tree, no assortment fetch. Catalogs are indexed in the store's own language,
+// so a query in that language finds what an English one misses.
+export async function searchVenueItems(slug, query) {
+  return (await searchAssortmentItems(slug, query)).map(normalizeMenuItem);
+}
+
 // Browse a venue's menu; optional free-text query and/or category slug filter.
 // Big grocery venues return loading_strategy "partial" with NO items at the top
 // level — those resolve through per-category fetches or server-side search.
@@ -196,7 +214,9 @@ export async function getMenu(slug, { query = null, categorySlug = null, limit =
   }
 
   return {
-    categories: categorySlug || !partial ? categories : categories.filter((c) => c.depth === 0),
+    // A query call is a search, not a browse — repeating the category tree on
+    // every lookup is what made per-item resolution so token-expensive.
+    ...(query ? {} : { categories: categorySlug || !partial ? categories : categories.filter((c) => c.depth === 0) }),
     loadingStrategy: a.loading_strategy || null,
     source,
     totalItems: items.length,
