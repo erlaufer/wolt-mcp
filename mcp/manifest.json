@@ -1,0 +1,57 @@
+{
+  "manifest_version": "0.2",
+  "name": "wolt-mcp",
+  "display_name": "Wolt MCP",
+  "version": "0.1.3",
+  "description": "Shop Wolt from Claude: search nearby stores, plan a single-store cart, and fill your Wolt basket. You review and check out on Wolt yourself.",
+  "long_description": "Tell Claude what you want to buy — a shopping list, a recipe, or just 'I need a shovel' — and it searches Wolt stores near you, picks the best products, and writes them to your Wolt basket. Nothing is ever ordered automatically: you open Wolt to review and check out. Runs entirely on your machine; your Wolt token never leaves it. If no delivery location is set, it makes a single city-level IP lookup to find stores near you — telling Claude your address or using your saved Wolt address overrides that.\n\nTo connect: install, then ask Claude \"Connect my Wolt account\". A browser window opens on wolt.com in a separate, empty profile — log in there and you're done. This needs a Chromium-based browser (Chrome, Edge, Brave, Vivaldi or Chromium) and Node 22+; on Firefox/Safari or older Node, paste a refresh token instead. Searching stores needs no login at all — only writing your basket does.",
+  "author": { "name": "erlaufer" },
+  "license": "MIT",
+  "keywords": ["wolt", "grocery", "shopping", "cart", "delivery"],
+  "server": {
+    "type": "node",
+    "entry_point": "server.mjs",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server.mjs"],
+      "env": {
+        "WOLT_BEARER_TOKEN": "${user_config.wolt_bearer_token}",
+        "WOLT_REFRESH_TOKEN": "${user_config.wolt_refresh_token}",
+        "WOLT_LAT": "${user_config.lat}",
+        "WOLT_LON": "${user_config.lon}"
+      }
+    }
+  },
+  "user_config": {
+    "wolt_bearer_token": {
+      "type": "string",
+      "title": "Wolt bearer token (optional — leave empty)",
+      "description": "Leave this blank. The easy way to connect is to install, then ask Claude: \"Connect my Wolt account\" — a browser window opens, you log into Wolt, done. Only fill this in if you'd rather paste a token by hand: from a logged-in wolt.com tab, DevTools → Network → any consumer-api.wolt.com request → copy the 'authorization' header. Expires after ~30 min, so the refresh token below is the better manual option.",
+      "sensitive": true,
+      "required": false
+    },
+    "wolt_refresh_token": {
+      "type": "string",
+      "title": "Wolt refresh token (optional — leave empty)",
+      "description": "Leave this blank unless you can't use the browser login. Asking Claude to \"Connect my Wolt account\" handles this automatically (it needs Chrome, Edge, Brave or another Chromium browser). To paste manually instead: on wolt.com, DevTools → Network → find a POST to authentication.wolt.com/v1/wauth2/access_token and copy refresh_token from its request payload. Paste once and it auto-renews forever.",
+      "sensitive": true,
+      "required": false
+    },
+    "lat": {
+      "type": "number",
+      "title": "Delivery latitude (optional)",
+      "description": "Leave blank. Your location is estimated from your IP on first use; better, just tell Claude your address or say \"use my saved Wolt address\".",
+      "required": false
+    },
+    "lon": {
+      "type": "number",
+      "title": "Delivery longitude (optional)",
+      "description": "Leave blank. Your location is estimated from your IP on first use; better, just tell Claude your address or say \"use my saved Wolt address\".",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": { "node": ">=22" }
+  }
+}

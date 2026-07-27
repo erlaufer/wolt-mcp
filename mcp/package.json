@@ -1,0 +1,23 @@
+{
+  "name": "wolt-mcp",
+  "version": "0.1.3",
+  "description": "MCP server for Wolt shopping: search grocery products near you, plan a single-store cart, and write it to your Wolt basket. Your MCP client's model does the reasoning — no API key needed here.",
+  "type": "module",
+  "license": "MIT",
+  "bin": { "wolt-mcp": "server.mjs" },
+  "files": ["server.mjs", "lib/", "README.md"],
+  "engines": { "node": ">=22" },
+  "keywords": ["mcp", "modelcontextprotocol", "wolt", "grocery", "shopping", "cart", "delivery"],
+  "author": "erlaufer",
+  "repository": { "type": "git", "url": "git+https://github.com/erlaufer/wolt-mcp.git" },
+  "homepage": "https://github.com/erlaufer/wolt-mcp#readme",
+  "bugs": { "url": "https://github.com/erlaufer/wolt-mcp/issues" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node ../test/recipe.test.mjs && node ../test/basket.test.mjs && node ../test/http.test.mjs && node ../test/version.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.23.8"
+  }
+}

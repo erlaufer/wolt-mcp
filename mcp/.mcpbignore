@@ -1,0 +1,15 @@
+# Never ship packaging leftovers or dev artifacts inside the bundle.
+*.tgz
+*.mcpb
+.mcpbignore
+test/
+**/*.test.mjs
+**/*.live.mjs
+
+# Dependencies ship their own test suites and TS sources; none are needed at
+# runtime and zod's alone is over a megabyte.
+node_modules/**/test/
+node_modules/**/tests/
+node_modules/**/*.test.ts
+node_modules/**/*.test.js
+node_modules/**/*.test-d.ts

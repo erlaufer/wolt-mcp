@@ -1,0 +1,17 @@
+{
+  "name": "wolt-mcp",
+  "displayName": "Wolt MCP",
+  "version": "0.1.3",
+  "description": "Shop Wolt from Claude: search nearby stores, plan a single-store cart, and fill your Wolt basket. You review and check out on Wolt yourself.",
+  "author": { "name": "erlaufer" },
+  "homepage": "https://github.com/erlaufer/wolt-mcp",
+  "repository": "https://github.com/erlaufer/wolt-mcp",
+  "license": "MIT",
+  "keywords": ["wolt", "grocery", "shopping", "cart", "delivery"],
+  "mcpServers": {
+    "wolt": {
+      "command": "npx",
+      "args": ["-y", "wolt-mcp"]
+    }
+  }
+}
