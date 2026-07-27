@@ -21,8 +21,12 @@ export function scoreMatch(ingredientName, candidateName) {
   let hits = 0;
   for (const t of a) if (b.has(t)) hits++;
   const recall = hits / a.length; // how much of the ingredient is covered
-  const substr = candidateName.toLowerCase().includes(ingredientName.toLowerCase()) ? 0.2 : 0;
-  return Math.min(1, recall * 0.9 + substr);
+  // Precision keeps flavored lookalikes below the plain product: "onion" is
+  // fully contained in "Bisli snack onion flavor 70g" too, but the plain
+  // "onion, packed" wastes far fewer words on being something else.
+  const precision = hits / b.size;
+  const substr = candidateName.toLowerCase().includes(ingredientName.toLowerCase()) ? 0.1 : 0;
+  return Math.min(1, recall * 0.7 + precision * 0.2 + substr);
 }
 
 // Rank candidates for one ingredient, best first. Filters out non-matches.

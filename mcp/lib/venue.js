@@ -170,17 +170,19 @@ async function fetchCategoryItems(slug, categorySlug) {
 
 // In-venue item search (server-side; the only way to reach every item of a
 // large "partial" grocery assortment).
-async function searchAssortmentItems(slug, query) {
-  const r = await woltFetch(`${ASSORTMENT_BASE}${slug}/assortment/items/search`, { method: "POST", body: { q: query } });
+async function searchAssortmentItems(slug, query, lang = "en") {
+  const r = await woltFetch(`${ASSORTMENT_BASE}${slug}/assortment/items/search`, { method: "POST", body: { q: query }, lang });
   if (!r.ok) throw new Error(`in-venue search failed: HTTP ${r.status}`);
   return r.json?.items || [];
 }
 
 // Lean in-venue search for batch flows: just the matching items, no category
 // tree, no assortment fetch. Catalogs are indexed in the store's own language,
-// so a query in that language finds what an English one misses.
-export async function searchVenueItems(slug, query) {
-  return (await searchAssortmentItems(slug, query)).map(normalizeMenuItem);
+// so a query in that language finds what an English one misses — and lang must
+// match the query's language, or Wolt translates the result names and token
+// scoring can never line them up with the query.
+export async function searchVenueItems(slug, query, { lang = "en" } = {}) {
+  return (await searchAssortmentItems(slug, query, lang)).map(normalizeMenuItem);
 }
 
 // Browse a venue's menu; optional free-text query and/or category slug filter.

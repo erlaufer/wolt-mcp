@@ -28,6 +28,11 @@ import { cdpLogin } from "./lib/cdp-login.js";
 import { getVenue, getMenu, getItemOptions, getCategories, resolveItem, parseItemUrl, searchVenueItems } from "./lib/venue.js";
 import { getOrderHistory, getOrder, geocodeAddress } from "./lib/account.js";
 
+// Detect the (Wolt-market) language a query is written in from its script, so
+// in-venue searches return names in the same language the query uses.
+const SCRIPT_LANGS = [[/[֐-׿]/, "he"], [/[؀-ۿ]/, "ar"], [/[Ѐ-ӿ]/, "ru"], [/[Ͱ-Ͽ]/, "el"], [/[Ⴀ-ჿ]/, "ka"]];
+const langOf = (s) => SCRIPT_LANGS.find(([re]) => re.test(String(s)))?.[1] || "en";
+
 // Resolve coordinates for a tool call: explicit args win, then the saved/env
 // location, then a one-shot city-level IP estimate. Throws an actionable error
 // when nothing is available so the model asks the user instead of guessing.
@@ -226,21 +231,23 @@ server.tool(
     try {
       if (venue_slug) {
         const venue = await getVenue(venue_slug);
-        const lineItems = [], missing = [];
+        const lineItems = [], missing = [], unmatched = [];
         for (const raw of ingredients) {
           const name = parseIngredientLine(raw).name;
+          const lang = langOf(name);
           let hits = [];
-          try { hits = await searchVenueItems(venue_slug, name); } catch (e) {}
+          try { hits = await searchVenueItems(venue_slug, name, { lang }); } catch (e) {}
           // Multi-word queries often miss; the store search wants short terms.
           if (!hits.length) {
             const longest = tokens(name).sort((a, b) => b.length - a.length)[0];
             if (longest && longest !== name) {
-              try { hits = await searchVenueItems(venue_slug, longest); } catch (e) {}
+              try { hits = await searchVenueItems(venue_slug, longest, { lang }); } catch (e) {}
             }
           }
-          // Only accept scored matches — the raw first hit of a missed query
-          // is garbage (a "shrimp" miss once returned Sprite Zero). A miss
-          // belongs in `missing`, where the model can rephrase it.
+          // Only auto-pick scored matches — the raw first hit of a missed
+          // query is garbage (a "shrimp" miss once returned Sprite Zero).
+          // Unscorable hits still go back as candidates for the model to
+          // judge — it matches by meaning, which token overlap can't.
           const ranked = rankCandidates(name, hits, { topK: 3, minScore: 0.15 });
           const best = ranked[0];
           if (best) {
@@ -248,6 +255,8 @@ server.tool(
               ingredient: raw, name: best.name, itemId: best.itemId, price: best.price,
               alternatives: ranked.slice(1).map((c) => ({ name: c.name, itemId: c.itemId, price: c.price }))
             });
+          } else if (hits.length) {
+            unmatched.push({ ingredient: raw, candidates: hits.slice(0, 3).map((c) => ({ name: c.name, itemId: c.itemId, price: c.price })) });
           } else missing.push(raw);
         }
         const basket = lineItems.length
@@ -256,7 +265,9 @@ server.tool(
         return text({
           venue: { venueId: venue.venueId, slug: venue_slug, name: venue.name, currency: venue.currency },
           coverage: `${lineItems.length}/${ingredients.length}`,
-          lineItems, missing, basket,
+          lineItems, missing,
+          ...(unmatched.length ? { unmatched, unmatchedNote: "The store returned these candidates but token scoring couldn't confirm them — judge each by meaning and add the good ones to the basket yourself (never a flavored/imitation substitute)." } : {}),
+          basket,
           ...(missing.length ? { note: "Missing items may just be a language/phrasing miss — retry them in the store's catalog language, or drop them." } : {})
         });
       }
