@@ -145,13 +145,25 @@ const server = new McpServer({ name: "wolt-mcp", version: VERSION }, {
 // --- search_products: one ingredient -> candidate products (no auth) ---
 server.tool(
   "search_products",
-  "Search Wolt grocery products for a single ingredient near a location. Returns candidates across nearby stores with itemId, name, price (minor units), venueId, venueName, whether it's sold by weight, and unit size. Call once per ingredient, then pick the best match yourself. For a whole recipe or shopping list, prefer plan_cart (pinned to a venue_slug) — it resolves every ingredient in one call. A basket must be all from ONE venueId. MATCHING RULES when picking: (1) Match the ingredient ITSELF — never a plant-based, vegan, imitation, or flavored substitute unless the user explicitly asked. e.g. 'Redefine Meat'/'plant-based mince' is NOT ground beef; margarine is NOT butter; imitation crab is NOT crab. (2) Do NOT just pick the cheapest — Wolt surfaces cheap 'Substitute Deals' that are often imitation products; prefer the real, mainstream item at a sensible package size. (3) Match the right FORM (crushed tomatoes ≠ tomato paste; ground beef ≠ beef sausage). When unsure, prefer the plainest real version of the actual ingredient.",
+  "Search Wolt grocery products for a single ingredient. Default: searches ALL nearby stores. With venue_slug: searches ONE store's own catalog (needs login; query in the store's language) — use this to check or fix a single item at the store you're building the basket at. For a whole recipe or shopping list, prefer plan_cart — it resolves every ingredient in one call. A basket must be all from ONE venueId. MATCHING RULES when picking: (1) Match the ingredient ITSELF — never a plant-based, vegan, imitation, or flavored substitute unless the user explicitly asked. e.g. 'Redefine Meat'/'plant-based mince' is NOT ground beef; margarine is NOT butter; imitation crab is NOT crab. (2) Do NOT just pick the cheapest — Wolt surfaces cheap 'Substitute Deals' that are often imitation products; prefer the real, mainstream item at a sensible package size. (3) Match the right FORM (crushed tomatoes ≠ tomato paste; ground beef ≠ beef sausage). When unsure, prefer the plainest real version of the actual ingredient.",
   {
-    query: z.string().describe("Product search term, e.g. 'crushed tomatoes'"),
+    query: z.string().describe("Product search term, e.g. 'crushed tomatoes' — in the store's catalog language when venue_slug is set"),
+    venue_slug: z.string().optional().describe("Search only this store's catalog (the venue you're building the basket at)"),
     lat: z.number().optional().describe("Override latitude; defaults to the saved location"),
     lon: z.number().optional().describe("Override longitude; defaults to the saved location")
   },
-  async ({ query, lat, lon }) => {
+  async ({ query, venue_slug, lat, lon }) => {
+    if (venue_slug) {
+      try {
+        const venue = await getVenue(venue_slug);
+        const hits = await searchVenueItems(venue_slug, query, { lang: langOf(query) });
+        return text({
+          query, venue: { venueId: venue.venueId, slug: venue_slug, name: venue.name, currency: venue.currency },
+          count: hits.length,
+          items: hits.slice(0, 15).map((c) => ({ itemId: c.itemId, name: c.name, price: c.price }))
+        });
+      } catch (e) { return errText(e.message); }
+    }
     try {
       ({ lat, lon } = await needLocation(lat, lon));
       const items = await searchItems(query, { lat, lon, lang: "en" });
@@ -240,6 +252,10 @@ server.tool(
 // Plan a whole ingredient list against ONE venue's own catalog. Returns the
 // same shape whether called for a pinned store or as one contestant of the
 // multi-store race in plan_cart's auto mode.
+// Markets whose catalogs are indexed in a non-Latin language: querying them in
+// English is the single biggest cause of garbage matches.
+const CATALOG_LANGS = { ISR: "he", GEO: "ka", GRC: "el" };
+
 async function planAtVenue(venue_slug, ingredients) {
   const venue = await getVenue(venue_slug);
   const lineItems = [], missing = [], unmatched = [];
@@ -275,10 +291,17 @@ async function planAtVenue(venue_slug, ingredients) {
   const basket = lineItems.length
     ? buildBasketBody(lineItems.map((li) => ({ candidate: { itemId: li.itemId, name: li.name, price: li.price, isWeighted: false }, count: 1 })), venue.venueId, venue.currency || "EUR")
     : null;
+  const catalogLang = CATALOG_LANGS[(venue.country || "").toUpperCase()];
+  const offLanguage = catalogLang
+    ? ingredients.filter((raw) => langOf(parseIngredientLine(raw).name) !== catalogLang).length
+    : 0;
   return {
     venue: { venueId: venue.venueId, slug: venue_slug, name: venue.name, currency: venue.currency },
     coverageCount: lineItems.length,
     cost: lineItems.reduce((s, li) => s + (li.price || 0), 0),
+    ...(offLanguage
+      ? { languageNote: `${offLanguage} ingredient line(s) are not in this store's catalog language ('${catalogLang}'). Scored matches for those lines can be wrong-category (e.g. 'brown rice' matching a ramen) — double-check them, and rewrite dubious lines in ${catalogLang} via plan_cart or search_products with venue_slug.` }
+      : {}),
     lineItems, missing, unmatched, basket
   };
 }
@@ -288,6 +311,7 @@ function planResponse(plan, total) {
   return {
     venue: plan.venue,
     coverage: `${plan.coverageCount}/${total}`,
+    ...(plan.languageNote ? { languageNote: plan.languageNote } : {}),
     ...(lowCoverage ? { lowCoverage: true, coverageNote: "Coverage is LOW — tell the user what's missing and agree on a store or substitutions BEFORE writing any basket." } : {}),
     lineItems: plan.lineItems,
     missing: plan.missing,
