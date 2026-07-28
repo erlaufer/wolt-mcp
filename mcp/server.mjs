@@ -415,10 +415,16 @@ server.tool(
       } catch (e) { /* best effort — a fresh basket write is still correct */ }
       const r = await woltFetch(BASKET_URL, { method: "POST", body });
       if (!r.ok) return errText(`cart write failed: HTTP ${r.status} ${r.text.slice(0, 300)}`);
-      const checkoutUrl = venue_slug
-        ? (country && city_slug ? `https://wolt.com/en/${country}/${city_slug}/venue/${venue_slug}` : `https://wolt.com/search?q=${encodeURIComponent(venue_slug)}`)
-        : "https://wolt.com";
-      return text({ ok: true, status: r.status, basketId: r.json?.id ?? null, itemsWritten: items.length, existingLinesPreserved: mergedFromExisting, checkoutUrl, note: `Basket written. Give the user this link to review and check out: ${checkoutUrl}` });
+      let checkoutUrl = "https://wolt.com";
+      if (venue_slug && country && city_slug) {
+        checkoutUrl = `https://wolt.com/en/${country}/${city_slug}/venue/${venue_slug}`;
+      } else if (venue_slug) {
+        // The venue's own share_url is the canonical link — no city/country
+        // plumbing needed from the caller.
+        try { checkoutUrl = (await getVenue(venue_slug)).shareUrl || checkoutUrl; } catch (e) {}
+        if (checkoutUrl === "https://wolt.com") checkoutUrl = `https://wolt.com/search?q=${encodeURIComponent(venue_slug)}`;
+      }
+      return text({ ok: true, status: r.status, basketId: r.json?.id ?? null, itemsWritten: items.length, existingLinesPreserved: mergedFromExisting, checkoutUrl, note: `Basket written. Give the user this link to review and check out: ${checkoutUrl}. Then call checkout_preview for the delivery-included total.` });
     } catch (e) {
       return errText(e.message);
     }

@@ -40,7 +40,8 @@ function cachePut(slug, venue) {
 // Venue detail from the static page (cached 24h).
 export async function getVenue(slug) {
   const cached = cacheGet(slug);
-  if (cached) return cached;
+  // Entries cached before shareUrl existed lack the field — refetch those.
+  if (cached && "shareUrl" in cached) return cached;
   const r = await woltFetch(`${VENUE_STATIC_BASE}${slug}/static`);
   if (!r.ok) throw new Error(`venue fetch failed for "${slug}": HTTP ${r.status}`);
   const v = r.json?.venue || {};
@@ -58,6 +59,7 @@ export async function getVenue(slug) {
     deliveryMethods: v.delivery_methods || null,
     deliveryBasePrice: v.delivery_base_price ?? null,
     openingTimes: (v.opening_times_schedule || []).map((d) => ({ day: d.day, times: d.formatted_times })),
+    shareUrl: v.share_url || null,
     website: v.website || null,
     phone: v.phone || null
   };
