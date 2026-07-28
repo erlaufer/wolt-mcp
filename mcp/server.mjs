@@ -15,7 +15,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import {
-  searchItems, selectBestVenue, buildBasketBody, BASKET_URL,
+  searchItems, selectBestVenue, rankVenues, buildBasketBody, BASKET_URL,
   BASKETS_PAGE_URL, BASKETS_DELETE_URL, isVenueObjectId, findBasketForVenue, mergeBasketItems
 } from "./lib/wolt.js";
 import { woltFetch } from "./lib/http.js";
@@ -32,6 +32,21 @@ import { getOrderHistory, getOrder, geocodeAddress } from "./lib/account.js";
 // in-venue searches return names in the same language the query uses.
 const SCRIPT_LANGS = [[/[֐-׿]/, "he"], [/[؀-ۿ]/, "ar"], [/[Ѐ-ӿ]/, "ru"], [/[Ͱ-Ͽ]/, "el"], [/[Ⴀ-ჿ]/, "ka"]];
 const langOf = (s) => SCRIPT_LANGS.find(([re]) => re.test(String(s)))?.[1] || "en";
+
+// Map with bounded concurrency — per-ingredient searches are independent HTTP
+// round-trips, and running them serially is what made planning slow.
+async function mapPool(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
 
 // Resolve coordinates for a tool call: explicit args win, then the saved/env
 // location, then a one-shot city-level IP estimate. Throws an actionable error
@@ -124,7 +139,7 @@ const errText = (msg) => ({ content: [{ type: "text", text: msg }], isError: tru
 // reporting a stale one (test/version.test.mjs keeps manifest.json in step).
 const { version: VERSION } = createRequire(import.meta.url)("./package.json");
 const server = new McpServer({ name: "wolt-mcp", version: VERSION }, {
-  instructions: "When the user wants to BUY something (not just browse), call wolt_status FIRST — it live-verifies the Wolt login. If it reports loginNeeded, sort the login out with the user (login_via_chrome, or set_wolt_token on Firefox/Safari) before searching and planning, so the work isn't lost to an expired session mid-checkout. Searching and browsing venues never need a login. For the delivery address: use_saved_address pulls the user's saved Wolt addresses and sets one as the search location (get_wolt_profile does NOT have addresses); a spoken address goes through resolve_address + set_location. Baskets are single-venue: source every item from one store — plan_cart with venue_slug resolves a whole ingredient list there in one call."
+  instructions: "When the user wants to BUY something (not just browse), call wolt_status FIRST — it live-verifies the Wolt login. If it reports loginNeeded, sort the login out with the user (login_via_chrome, or set_wolt_token on Firefox/Safari) before searching and planning, so the work isn't lost to an expired session mid-checkout. Searching and browsing venues never need a login. For the delivery address: use_saved_address pulls the user's saved Wolt addresses and sets one as the search location (get_wolt_profile does NOT have addresses); a spoken address goes through resolve_address + set_location. Baskets are single-venue: source every item from one store. The fast path for a shopping list is wolt_status -> use_saved_address (if no location) -> ONE plan_cart call (it auto-picks the store and reports runner-up coverage) -> review the matches -> add_to_cart -> checkout_preview. Don't compare stores manually with repeated searches unless the user asks, and never write a lowCoverage plan without agreeing with the user first."
 });
 
 // --- search_products: one ingredient -> candidate products (no auth) ---
@@ -140,13 +155,18 @@ server.tool(
     try {
       ({ lat, lon } = await needLocation(lat, lon));
       const items = await searchItems(query, { lat, lon, lang: "en" });
-      const top = items.slice(0, 20).map((c) => ({
-        itemId: c.itemId, name: c.name, price: c.price, currency: c.currency,
-        venueId: c.venueId, venueName: c.venueName, venueRating: c.venueRating,
-        venueSlug: c.venueSlug, citySlug: c.citySlug, country: c.country,
-        isWeighted: c.isWeighted, unitSize: c.unitSizeText
-      }));
-      return text({ query, count: top.length, items: top });
+      // Venue metadata goes once into `venues`, not on all 20 items — these
+      // responses are read by a model every turn, and the repetition was
+      // roughly half the payload.
+      const venues = {};
+      const top = items.slice(0, 20).map((c) => {
+        venues[c.venueId] ||= { name: c.venueName, slug: c.venueSlug, rating: c.venueRating, citySlug: c.citySlug, country: c.country };
+        return {
+          itemId: c.itemId, name: c.name, price: c.price, currency: c.currency,
+          venueId: c.venueId, isWeighted: c.isWeighted, unitSize: c.unitSizeText
+        };
+      });
+      return text({ query, count: top.length, items: top, venues });
     } catch (e) {
       return errText(`search failed: ${e.message}`);
     }
@@ -166,12 +186,12 @@ server.tool(
     try {
       ({ lat, lon } = await needLocation(lat, lon));
       const items = await searchItems(query, { lat, lon, lang: "en", mode: "restaurant" });
-      const top = items.slice(0, 20).map((c) => ({
-        itemId: c.itemId, name: c.name, price: c.price, currency: c.currency,
-        venueId: c.venueId, venueName: c.venueName, venueRating: c.venueRating,
-        venueSlug: c.venueSlug, citySlug: c.citySlug, country: c.country
-      }));
-      return text({ query, count: top.length, dishes: top });
+      const venues = {};
+      const top = items.slice(0, 20).map((c) => {
+        venues[c.venueId] ||= { name: c.venueName, slug: c.venueSlug, rating: c.venueRating, citySlug: c.citySlug, country: c.country };
+        return { itemId: c.itemId, name: c.name, price: c.price, currency: c.currency, venueId: c.venueId };
+      });
+      return text({ query, count: top.length, dishes: top, venues });
     } catch (e) {
       return errText(`restaurant search failed: ${e.message}`);
     }
@@ -217,67 +237,108 @@ server.tool(
   }
 );
 
-// --- plan_cart: convenience one-shot (heuristic matching + store selection) ---
+// Plan a whole ingredient list against ONE venue's own catalog. Returns the
+// same shape whether called for a pinned store or as one contestant of the
+// multi-store race in plan_cart's auto mode.
+async function planAtVenue(venue_slug, ingredients) {
+  const venue = await getVenue(venue_slug);
+  const lineItems = [], missing = [], unmatched = [];
+  const resolved = await mapPool(ingredients, 4, async (raw) => {
+    const name = parseIngredientLine(raw).name;
+    const lang = langOf(name);
+    let hits = [];
+    try { hits = await searchVenueItems(venue_slug, name, { lang }); } catch (e) {}
+    // Multi-word queries often miss; the store search wants short terms.
+    if (!hits.length) {
+      const longest = tokens(name).sort((a, b) => b.length - a.length)[0];
+      if (longest && longest !== name) {
+        try { hits = await searchVenueItems(venue_slug, longest, { lang }); } catch (e) {}
+      }
+    }
+    // Only auto-pick scored matches — the raw first hit of a missed query is
+    // garbage (a "shrimp" miss once returned Sprite Zero). Unscorable hits
+    // still go back as candidates for the model to judge — it matches by
+    // meaning, which token overlap can't.
+    return { raw, hits, ranked: rankCandidates(name, hits, { topK: 3, minScore: 0.15 }) };
+  });
+  for (const { raw, hits, ranked } of resolved) {
+    const best = ranked[0];
+    if (best) {
+      lineItems.push({
+        ingredient: raw, name: best.name, itemId: best.itemId, price: best.price,
+        alternatives: ranked.slice(1).map((c) => ({ name: c.name, itemId: c.itemId, price: c.price }))
+      });
+    } else if (hits.length) {
+      unmatched.push({ ingredient: raw, candidates: hits.slice(0, 3).map((c) => ({ name: c.name, itemId: c.itemId, price: c.price })) });
+    } else missing.push(raw);
+  }
+  const basket = lineItems.length
+    ? buildBasketBody(lineItems.map((li) => ({ candidate: { itemId: li.itemId, name: li.name, price: li.price, isWeighted: false }, count: 1 })), venue.venueId, venue.currency || "EUR")
+    : null;
+  return {
+    venue: { venueId: venue.venueId, slug: venue_slug, name: venue.name, currency: venue.currency },
+    coverageCount: lineItems.length,
+    cost: lineItems.reduce((s, li) => s + (li.price || 0), 0),
+    lineItems, missing, unmatched, basket
+  };
+}
+
+function planResponse(plan, total) {
+  const lowCoverage = plan.coverageCount < Math.ceil(total * 0.7);
+  return {
+    venue: plan.venue,
+    coverage: `${plan.coverageCount}/${total}`,
+    ...(lowCoverage ? { lowCoverage: true, coverageNote: "Coverage is LOW — tell the user what's missing and agree on a store or substitutions BEFORE writing any basket." } : {}),
+    lineItems: plan.lineItems,
+    missing: plan.missing,
+    ...(plan.unmatched.length ? { unmatched: plan.unmatched, unmatchedNote: "The store returned these candidates but token scoring couldn't confirm them — judge each by meaning and add the good ones to the basket yourself (never a flavored/imitation substitute)." } : {}),
+    basket: plan.basket,
+    ...(plan.missing.length ? { note: "Missing items may just be a language/phrasing miss — retry them in the store's catalog language, or drop them." } : {})
+  };
+}
+
+// --- plan_cart: whole list -> single-store plan, one call ---
 server.tool(
   "plan_cart",
-  "Resolve a whole ingredient list in ONE call. With venue_slug: every ingredient is matched against that store's catalog (needs login) — the cheap way to build a full single-store cart; write ingredient lines in the store's own language for best matches. Without venue_slug: searches globally and picks the store with best coverage (heuristic, no login) — good for a first pass, then re-run pinned to the store you settle on. Returns line items + a ready add_to_cart basket; sanity-check the matches before writing.",
+  "Resolve a whole ingredient list into a single-store cart in ONE call. Without venue_slug it auto-picks: shortlists the best-covering nearby stores and races the list against each store's own catalog, returning the winner plus per-store coverage of the runners-up (evaluatedVenues) — if lowCoverage is flagged, agree with the user before writing anything. With venue_slug it plans against that store only. Write ingredient lines in the store's catalog language (e.g. Hebrew for Israeli stores). Returns line items with alternatives + a ready add_to_cart basket; sanity-check matches before writing.",
   {
     ingredients: z.array(z.string()).describe("Ingredient lines, e.g. ['800 g crushed tomatoes', '1 onion'] — use the store's catalog language (e.g. Hebrew for Israeli stores)"),
-    venue_slug: z.string().optional().describe("Pin planning to this store instead of auto-picking; resolves every ingredient in-venue in one call"),
+    venue_slug: z.string().optional().describe("Pin planning to this store instead of auto-picking"),
     lat: z.number().optional().describe("Override latitude; defaults to the saved location"),
     lon: z.number().optional().describe("Override longitude; defaults to the saved location")
   },
   async ({ ingredients, venue_slug, lat, lon }) => {
     try {
       if (venue_slug) {
-        const venue = await getVenue(venue_slug);
-        const lineItems = [], missing = [], unmatched = [];
-        for (const raw of ingredients) {
-          const name = parseIngredientLine(raw).name;
-          const lang = langOf(name);
-          let hits = [];
-          try { hits = await searchVenueItems(venue_slug, name, { lang }); } catch (e) {}
-          // Multi-word queries often miss; the store search wants short terms.
-          if (!hits.length) {
-            const longest = tokens(name).sort((a, b) => b.length - a.length)[0];
-            if (longest && longest !== name) {
-              try { hits = await searchVenueItems(venue_slug, longest, { lang }); } catch (e) {}
-            }
-          }
-          // Only auto-pick scored matches — the raw first hit of a missed
-          // query is garbage (a "shrimp" miss once returned Sprite Zero).
-          // Unscorable hits still go back as candidates for the model to
-          // judge — it matches by meaning, which token overlap can't.
-          const ranked = rankCandidates(name, hits, { topK: 3, minScore: 0.15 });
-          const best = ranked[0];
-          if (best) {
-            lineItems.push({
-              ingredient: raw, name: best.name, itemId: best.itemId, price: best.price,
-              alternatives: ranked.slice(1).map((c) => ({ name: c.name, itemId: c.itemId, price: c.price }))
-            });
-          } else if (hits.length) {
-            unmatched.push({ ingredient: raw, candidates: hits.slice(0, 3).map((c) => ({ name: c.name, itemId: c.itemId, price: c.price })) });
-          } else missing.push(raw);
-        }
-        const basket = lineItems.length
-          ? buildBasketBody(lineItems.map((li) => ({ candidate: { itemId: li.itemId, name: li.name, price: li.price, isWeighted: false }, count: 1 })), venue.venueId, venue.currency || "EUR")
-          : null;
-        return text({
-          venue: { venueId: venue.venueId, slug: venue_slug, name: venue.name, currency: venue.currency },
-          coverage: `${lineItems.length}/${ingredients.length}`,
-          lineItems, missing,
-          ...(unmatched.length ? { unmatched, unmatchedNote: "The store returned these candidates but token scoring couldn't confirm them — judge each by meaning and add the good ones to the basket yourself (never a flavored/imitation substitute)." } : {}),
-          basket,
-          ...(missing.length ? { note: "Missing items may just be a language/phrasing miss — retry them in the store's catalog language, or drop them." } : {})
-        });
+        return text(planResponse(await planAtVenue(venue_slug, ingredients), ingredients.length));
       }
       ({ lat, lon } = await needLocation(lat, lon));
-      const perIngredient = [];
-      for (const raw of ingredients) {
+      const perIngredient = await mapPool(ingredients, 6, async (raw) => {
         const q = parseIngredientLine(raw).name;
         let candidates = [];
         try { candidates = await searchItems(q, { lat, lon, lang: "en" }); } catch (e) {}
-        perIngredient.push({ ingredient: raw, spec: { query: q }, candidates: rankCandidates(q, candidates) });
+        return { ingredient: raw, spec: { query: q }, candidates: rankCandidates(q, candidates) };
+      });
+      // In-venue planning needs a token; without one, fall back to the pure
+      // global-search pick rather than failing.
+      let hasToken = true;
+      try { await getAccessToken(); } catch (e) { hasToken = false; }
+      if (hasToken) {
+        const shortlist = rankVenues(perIngredient).slice(0, 5).filter((r) => r.venue.venueSlug);
+        if (shortlist.length) {
+          const plans = (await mapPool(shortlist, 5, async (r) => {
+            try { return await planAtVenue(r.venue.venueSlug, ingredients); } catch (e) { return null; }
+          })).filter(Boolean);
+          if (plans.length) {
+            // Coverage always beats price: a cheap 2/10 store is not a plan.
+            plans.sort((a, b) => b.coverageCount - a.coverageCount || a.cost - b.cost);
+            const best = plans[0];
+            return text({
+              ...planResponse(best, ingredients.length),
+              evaluatedVenues: plans.map((p) => ({ name: p.venue.name, slug: p.venue.slug, coverage: `${p.coverageCount}/${ingredients.length}` }))
+            });
+          }
+        }
       }
       const { venue, chosen, missing } = selectBestVenue(perIngredient);
       if (!venue) return text({ venue: null, missing, note: "No store covered these ingredients." });
