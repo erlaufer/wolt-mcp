@@ -1,0 +1,44 @@
+{
+  "markets": {
+    "helsinki": {
+      "venue": "wolt-market-kamppi",
+      "requested": 5,
+      "coverage": 2,
+      "correct": 1,
+      "traps": 1,
+      "unmatched": 3,
+      "score": 0.2
+    },
+    "helsinki-fi": {
+      "venue": "wolt-market-kamppi",
+      "requested": 5,
+      "coverage": 5,
+      "correct": 3,
+      "traps": 2,
+      "unmatched": 0,
+      "score": 0.6
+    },
+    "helsinki-fi-base": {
+      "venue": "wolt-market-kamppi",
+      "requested": 5,
+      "coverage": 5,
+      "correct": 4,
+      "traps": 1,
+      "unmatched": 0,
+      "score": 0.8
+    },
+    "athens": {
+      "venue": "4-seasons-organic-food-market",
+      "requested": 5,
+      "coverage": 5,
+      "correct": 3,
+      "traps": 2,
+      "unmatched": 0,
+      "score": 0.6
+    }
+  },
+  "overall": {
+    "score": 0.55,
+    "traps": 6
+  }
+}

@@ -44,7 +44,7 @@ export function translationPreflight(ingredients, catalogLanguage) {
     catalogLanguage,
     offLanguageCount: off,
     totalIngredients: ingredients.length,
-    note: `This market's catalogs are indexed in '${catalogLanguage}'. Translate the ingredient lines to ${catalogLanguage} yourself and call plan_cart again — planning them as-is produces wrong-category matches.`
+    note: `This market's catalogs are indexed in '${catalogLanguage}'. Translate the ingredient lines to ${catalogLanguage} yourself — naming each product in dictionary form, singular nominative, the way a shelf label reads — and call plan_cart again. Planning them as-is produces wrong-category matches.`
   };
 }
 
@@ -160,6 +160,6 @@ export function planResponse(plan, total) {
     ...(!plan.basket && plan.lineItems.length
       ? { basketNote: "No currency on record for this venue — call add_to_cart with an explicit currency taken from search_products results." }
       : {}),
-    ...(plan.missing.length ? { note: "Missing items may just be a language/phrasing miss — retry them in the store's catalog language, or drop them." } : {})
+    ...(plan.missing.length ? { note: "Missing items may just be a phrasing miss — retry them in the store's catalog language and in dictionary form (singular nominative, as a shelf label reads; catalog search matches prefixes, so an inflected word finds little), or drop them." } : {})
   };
 }

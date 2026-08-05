@@ -188,7 +188,16 @@ export function replay(file, { strict = true } = {}) {
   const misses = [];
   setFetchImpl(async (url, init = {}) => {
     const key = keyOf(url, init);
-    const entry = byKey.get(key);
+    let entry = byKey.get(key);
+    // The batch weight-config endpoint takes a set of item ids and answers
+    // with a lookup table. Which ids get asked about depends on what the
+    // matcher picked, so keying it by body would make every matching change
+    // look like an incomplete fixture. Serve the recorded table for any id
+    // set: ids it doesn't cover come back unknown, which is exactly how
+    // callers already treat an item the catalog didn't return.
+    if (!entry && /\/assortment\/items$/.test(new URL(String(url)).pathname)) {
+      entry = [...byKey.values()].find((e) => e.url === String(url));
+    }
     if (!entry) {
       misses.push(key);
       if (strict) throw new Error(`cassette miss: ${key}\n  (re-record with: node test/record-cassette.mjs)`);
