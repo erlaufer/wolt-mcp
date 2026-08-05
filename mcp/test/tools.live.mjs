@@ -62,7 +62,10 @@ process.on("exit", () => {
 });
 process.on("SIGINT", () => process.exit(130));
 
-await call("set_location", { lat: addr?.saved?.lat ?? 60.1699, lon: addr?.saved?.lon ?? 24.9384, label: "live-test (temporary)" }, (j) => !!j.saved);
+const located = await call("set_location", { lat: addr?.saved?.lat ?? 60.1699, lon: addr?.saved?.lon ?? 24.9384, label: "live-test (temporary)" }, (j) => !!j.saved);
+// Which language this market's catalogs are indexed in decides what language
+// the plan_cart list below has to be written in.
+const catalogLanguage = located?.catalogLanguage || null;
 
 // --- search & discovery ---
 const grocery = await call("search_products", { query: "salt" }, (j) => j.count > 0);
@@ -89,25 +92,73 @@ if (dish) {
 }
 
 // --- recipe convenience ---
-await call("plan_cart", { ingredients: ["2 onions", "500g pasta"] }, (j) => !!j.venue || !!j.missing);
+// plan_cart refuses a list written in the wrong script for the market's
+// catalogs (needsTranslation), so the list follows the market this account
+// sits in. A market we have no list for is allowed to come back
+// needsTranslation — that is the correct answer there, not a failure.
+const SHOPPING_LISTS = {
+  en: ["2 onions", "500 g pasta"],
+  he: ["2 בצלים", "500 גרם פסטה"],
+  el: ["2 κρεμμύδια", "500 γρ ζυμαρικά"],
+  ru: ["2 луковицы", "500 г макарон"],
+  ka: ["2 ხახვი", "500 გ მაკარონი"]
+};
+const knownList = !catalogLanguage || !!SHOPPING_LISTS[catalogLanguage];
+await call(
+  "plan_cart",
+  { ingredients: SHOPPING_LISTS[catalogLanguage] || SHOPPING_LISTS.en },
+  (j) => !!j.venue || !!j.missing || (!knownList && j.needsTranslation === true)
+);
 
 // --- cart CRUD on a TEMP grocery basket (not the pinned restaurant venue) ---
 const pick = grocery?.items?.find((i) => /^[a-f0-9]{24}$/.test(i.venueId));
+// Venue metadata lives in the response's `venues` map, keyed by venueId — the
+// items themselves carry only what differs per item. Reading slug/city/country
+// off the item yields undefined, which is how a caller ends up with no
+// currency and no checkout link.
+const pickVenue = (pick && grocery?.venues?.[pick.venueId]) || {};
 let cartOk = false;
 if (pick) {
   const added = await call("add_to_cart", {
-    venue_id: pick.venueId, venue_slug: pick.venueSlug, city_slug: pick.citySlug, country: pick.country,
+    venue_id: pick.venueId, venue_slug: pickVenue.slug, city_slug: pickVenue.citySlug,
+    country: pickVenue.country, currency: pick.currency,
     items: [{ id: pick.itemId, name: pick.name, price: pick.price, count: 1, weighted: false, grams: null }]
   }, (j) => j.ok === true);
   const baskets = await call("get_baskets", {}, (j) => j.count >= 1);
   const temp = baskets?.baskets?.find((b) => b.venueId === pick.venueId);
   cartOk = !!temp;
   await call("update_cart_item", { venue_id: pick.venueId, item_id: pick.itemId, count: 2 }, (j) => j.ok === true && j.newCount === 2);
-  await call("checkout_preview", { venue_id: pick.venueId, venue_slug: pick.venueSlug }, (j) => j.payableAmount > 0);
+  await call("checkout_preview", { venue_id: pick.venueId, venue_slug: pickVenue.slug }, (j) => j.payableAmount > 0);
   if (temp) await call("clear_basket", { basket_id: temp.basketId }, (j) => j.ok === true);
   else skip("clear_basket", "temp basket not found");
 } else {
   ["add_to_cart", "get_baskets", "update_cart_item", "checkout_preview", "clear_basket"].forEach((t) => skip(t, "no grocery candidate"));
+}
+
+// --- weighted line on its own temp basket ---
+// Wolt accepts a weighted line whose grams aren't a multiple of the item's
+// step and then silently DROPS it, so this leg asks for a deliberately
+// off-step weight (349 g) and checks two things the unit tests can't: that the
+// catalog lookup snapped it (reported as `adjustments`), and that the line was
+// really in the basket afterwards (`droppedLines` absent, read back after the
+// write). Deli counters are where weighted items live, hence the meat queries.
+const MEAT_QUERIES = { en: "chicken breast", he: "עוף", el: "κοτόπουλο", ru: "курица", ka: "ქათამი", ja: "鶏肉" };
+const meatQuery = MEAT_QUERIES[catalogLanguage] || MEAT_QUERIES.en;
+const weighedSearch = await call("search_products", { query: meatQuery }, (j) => j.count >= 0);
+const wPick = weighedSearch?.items?.find((i) => i.isWeighted && /^[a-f0-9]{24}$/.test(i.venueId) && weighedSearch.venues?.[i.venueId]?.slug);
+if (wPick) {
+  const wVenue = weighedSearch.venues[wPick.venueId];
+  await call("add_to_cart", {
+    venue_id: wPick.venueId, venue_slug: wVenue.slug, city_slug: wVenue.citySlug,
+    country: wVenue.country, currency: wPick.currency,
+    items: [{ id: wPick.itemId, name: wPick.name, price: wPick.price, count: 1, weighted: true, grams: 349 }]
+  }, (j) => j.ok === true && !j.droppedLines && j.verified === true && (j.adjustments || []).length === 1);
+  const wBaskets = await call("get_baskets", {}, (j) => j.count >= 1);
+  const wTemp = wBaskets?.baskets?.find((b) => b.venueId === wPick.venueId);
+  if (wTemp) await call("clear_basket", { basket_id: wTemp.basketId }, (j) => j.ok === true);
+  else skip("clear_basket", "weighted temp basket not found");
+} else {
+  ["add_to_cart", "clear_basket"].forEach((t) => skip(t, `no weighted candidate for "${meatQuery}"`));
 }
 
 // --- orders ---

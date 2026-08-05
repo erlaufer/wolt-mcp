@@ -329,10 +329,10 @@ server.tool(
   "Write items to the user's Wolt basket for one venue. All items must share the venue_id. Needs login (if wolt_status says loginNeeded, do that first). ALWAYS pass venue_slug: it lets each line's weighted flag be reconciled against how the catalog actually sells the item — items named '~900 g pack' are often COUNT items, truly weighted items only accept multiples of their gramsPerStep, and either mismatch is silently dropped by Wolt. Corrections made are reported as `adjustments`. The response also re-reads the basket and reports droppedLines for anything Wolt still discarded — treat those as NOT added. Returns a checkoutUrl — give it to the user, and call checkout_preview for the real total including fees. Nothing is ever ordered automatically; the user reviews and pays on wolt.com.",
   {
     venue_id: z.string(),
-    venue_slug: z.string().optional().describe("venueSlug from search results — used to build the checkout link"),
-    city_slug: z.string().optional().describe("citySlug from search results"),
-    country: z.string().optional().describe("3-letter country from search results, e.g. 'fin', 'deu', 'jpn'"),
-    currency: z.string().optional().describe("Currency from search results (e.g. 'EUR', 'SEK', 'PLN'); resolved from the venue if omitted"),
+    venue_slug: z.string().optional().describe("Venue slug — in search_products results it is venues[venueId].slug, not a field on the item"),
+    city_slug: z.string().optional().describe("City slug — venues[venueId].citySlug in search_products results"),
+    country: z.string().optional().describe("3-letter country — venues[venueId].country in search_products results, e.g. 'fin', 'deu', 'jpn'"),
+    currency: z.string().optional().describe("Currency, taken from the item you picked (e.g. 'EUR', 'SEK', 'PLN'); resolved from the venue if omitted"),
     items: z.array(z.object({
       id: z.string(),
       name: z.string(),
