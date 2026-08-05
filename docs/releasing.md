@@ -8,11 +8,20 @@ without that asset breaks the Desktop install path).
 ## 1. Pre-flight
 
 ```sh
+cd mcp && npm ci              # clean install: the same tree CI and the bundle get
 cd mcp && npm test            # offline suite: parsing, basket shape, currency,
                               # language, planning, and the version guard
 node mcp/test/tools.live.mjs  # every registered tool against a live account;
                               # needs tokens, cleans up after itself
+cd mcp && npm audit           # see below — the bundle ships node_modules
 ```
+
+`npm audit` matters more here than for a normal library: the `.mcpb` bundle
+packs `node_modules`, so whatever versions are installed when it is built are
+distributed to every Claude Desktop user, reachable code or not. Clear what is
+fixable inside the declared ranges (`npm update --package-lock-only`, then
+re-run `npm ci`) before building, and note anything left over in the release
+notes rather than letting a scanner find it first.
 
 The live suite has a coverage guard that fails if any registered tool goes
 uncalled — a new tool cannot ship untested. Only the interactive login tool is
