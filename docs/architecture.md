@@ -87,6 +87,8 @@ a silent pricing bug, not a recoverable one.
 - `node test/mcp.live.mjs` — lower-level live check of the lib layer directly (refresh → search → basket write → merge/persist verification → cleanup), bypassing the MCP protocol. Needs real credentials and writes a temporary basket to your account.
 - `node mcp/test/tools.live.mjs` — drives every tool through a real stdio MCP client against a live account. Cart tests use a temporary basket and clean up; favorites tests are self-reversing; `set_wolt_token` round-trips the tokens already on disk rather than writing a dummy. A coverage guard compares the tools actually called against `listTools()` and fails the run on any gap, so a newly added tool can't go untested. Only `login_via_chrome` is skipped, being interactive.
 
+- `npm run bench` (`node test/bench.mjs`) — scores match quality against the same recorded catalogs and prints the delta against `test/benchmarks/baseline.json` (`--save` adopts a new baseline). It deliberately does not report coverage, which lies: a run can fill every line while putting tomato pesto where tomatoes belong. It counts **correct** lines and **traps** — lines filled with the wrong thing, which is worse than a missing line because the user is told it's handled. Ground truth is per-market accept/reject name patterns, and each market scores against a pinned store so a matching change is measured on a fixed catalog rather than on whichever shop won that minute's race.
+
 Release steps (version bump, `.mcpb` build, publish, post-publish verification) live in [releasing.md](releasing.md).
 
 ## Known limitations
