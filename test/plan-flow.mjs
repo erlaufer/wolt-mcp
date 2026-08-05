@@ -46,6 +46,17 @@ export const MARKETS = {
     pinnedVenue: "wolt-market-kamppi",
     ingredients: ["500 g spagetti", "400 g tomaattimurska", "200 g parmesaani", "2 sipuli", "oliiviöljy"]
   },
+  // HELD OUT. Added after the confidence flag's form-word list was written,
+  // against a market and a language whose catalogs nobody had looked at. The
+  // flag scoring 6/6 on the markets that motivated it proves very little; what
+  // it does here is the honest number.
+  warsaw: {
+    lat: 52.2297,
+    lon: 21.0122,
+    note: "held-out market: Polish, Latin script, heavily inflecting",
+    pinnedVenue: "lisek-srodmiescie",
+    ingredients: ["500 g makaron", "400 g pomidory krojone", "200 g parmezan", "2 cebula", "oliwa z oliwek"]
+  },
   athens: {
     lat: 37.9838,
     lon: 23.7275,

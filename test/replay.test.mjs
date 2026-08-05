@@ -43,12 +43,12 @@ const play = async (name) => {
 };
 
 // Every plan, in every market, must hold these regardless of catalog churn.
-function assertPlanShape(name, plan, { language, ingredients }) {
+function assertPlanShape(name, plan, { language, ingredients, currency = "EUR" }) {
   assert(plan, `${name}: a plan for the pinned store`);
   assert.equal(plan.venue.catalogLanguage, language, `${name}: catalog language`);
-  assert.equal(plan.venue.currency, "EUR", `${name}: currency resolved from the venue, not a default`);
+  assert.equal(plan.venue.currency, currency, `${name}: currency resolved from the venue, not a default`);
   if (plan.lineItems.length) {
-    assert.equal(plan.basket.currency, "EUR");
+    assert.equal(plan.basket.currency, currency);
     assert(isVenueObjectId(plan.basket.venue_id), `${name}: basket carries a real venue id, never a slug`);
     assert.equal(plan.basket.items.length, plan.lineItems.length);
     for (const li of plan.lineItems) assert(li.itemId && li.name && li.price > 0, `${name}: line looks real`);
@@ -79,6 +79,21 @@ function assertPlanShape(name, plan, { language, ingredients }) {
   assert(out.weightConfigs instanceof Map && out.weightConfigs.size > 0, "weight configs resolved for the winning lines");
 }
 
+// --- a non-euro market, and the confidence flag on held-out ground ---
+// Warsaw was recorded after the flag's form-word list was written, so what it
+// catches here it catches without having been tuned for it.
+{
+  const out = await play("warsaw");
+  assert.equal(out.marketLanguage, "pl");
+  assertPlanShape("warsaw", out.pinnedPlan, { language: "pl", ingredients: MARKETS.warsaw.ingredients, currency: "PLN" });
+  const flagged = out.pinnedPlan.lineItems.filter((li) => li.confidence === "low");
+  // "Chipsy ziemniaczane o smaku sera parmezan" — crisps flavoured with the
+  // ingredient, scoring as well as the real cheese. Exactly the pick a user
+  // should never find in their basket unquestioned.
+  assert(flagged.some((li) => /chipsy/i.test(li.name)), "the crisps pick is flagged, not asserted");
+  for (const li of flagged) assert(li.check, "a flagged line says why");
+}
+
 // --- inflection: the same list, same store, two grammatical forms ---
 // Both are Finnish and both are correct Finnish. The dictionary-form list is
 // what a shelf label looks like; the inflected one is what a recipe says.
@@ -106,4 +121,4 @@ function assertPlanShape(name, plan, { language, ingredients }) {
   assert.deepEqual(a.pinnedPlan.lineItems.map((li) => li.itemId), b.pinnedPlan.lineItems.map((li) => li.itemId));
 }
 
-console.log("replay.test.mjs: planning replayed against 4 recorded markets");
+console.log("replay.test.mjs: planning replayed against 5 recorded markets");

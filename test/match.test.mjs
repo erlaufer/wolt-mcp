@@ -3,7 +3,7 @@
 // "tomaattisose" (paste). Those two pulls are in tension, so both directions
 // are pinned here.
 import assert from "node:assert";
-import { tokensMatch, scoreMatch, rankCandidates } from "../mcp/lib/match.js";
+import { tokensMatch, scoreMatch, rankCandidates, differentForm } from "../mcp/lib/match.js";
 
 // --- inflected forms must match their dictionary form ---
 for (const [a, b, why] of [
@@ -55,4 +55,34 @@ const hits = rankCandidates("sipulia", [
 assert.equal(hits.length, 1, "the onion is found, the banana is not");
 assert.match(hits[0].name, /Sipuli/);
 
-console.log("match.test.mjs: inflection tolerated, compounds still rejected");
+// --- form words: the flag that catches confident-and-wrong picks ---
+// Scoring can't separate these from the real product, so they get named.
+for (const [ingredient, candidate, word] of [
+  ["parmesaani", "Mutti parmesaani pastakastike 400g", "kastike"],
+  ["spagettia", "Piltti Spagettia ja jauhelihakastiketta 190g", "kastike"],
+  ["parmezan", "Chipsy ziemniaczane o smaku sera parmezan, 90 g", "Chipsy"],
+  ["ντομάτες", "Πέστο από Λιαστές Ντομάτες Bio 120gr", "Πέστο"],
+  ["κρεμμύδια", "Τραγανά Κρεμμύδια σε βάζο 75gr", "Τραγανά"],
+  ["tomato", "Tomato paste 200g", "paste"],
+  ["onion", "Sourcream & Onion crisps 275g", "crisps"]
+]) {
+  const got = differentForm(ingredient, candidate);
+  assert(got, `"${candidate}" should be flagged for "${ingredient}" (expected around "${word}")`);
+}
+
+// ...but a plain product, however wordy its packaging, must not be flagged:
+// a flag that fires on everything trains the model to ignore it.
+for (const [ingredient, candidate] of [
+  ["sipuli", "Sipuli kotimainen pussi, 500g"],
+  ["oliiviöljy", "Borges Classic oliiviöljy 500ml"],
+  ["tomaattimurska", "Eldorado tomaattimurska 390g"],
+  ["makaron", "Lubella Makaron spaghetti, 400 g"],
+  ["ελαιόλαδο", "Ελαιόλαδο 250ml Γέρας"],
+  // The line asked for the form itself, so naming it is not a surprise.
+  ["tomato paste", "Mutti tomato paste 200g"],
+  ["jauheliha", "Naudan jauheliha 400g"]
+]) {
+  assert.equal(differentForm(ingredient, candidate), null, `"${candidate}" must not be flagged for "${ingredient}"`);
+}
+
+console.log("match.test.mjs: inflection tolerated, compounds rejected, wrong forms flagged");

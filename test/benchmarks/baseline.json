@@ -6,6 +6,8 @@
       "coverage": 2,
       "correct": 1,
       "traps": 1,
+      "trapsFlagged": 1,
+      "falseAlarms": 0,
       "unmatched": 3,
       "score": 0.2
     },
@@ -15,6 +17,8 @@
       "coverage": 5,
       "correct": 3,
       "traps": 2,
+      "trapsFlagged": 2,
+      "falseAlarms": 0,
       "unmatched": 0,
       "score": 0.6
     },
@@ -24,6 +28,19 @@
       "coverage": 5,
       "correct": 4,
       "traps": 1,
+      "trapsFlagged": 1,
+      "falseAlarms": 0,
+      "unmatched": 0,
+      "score": 0.8
+    },
+    "warsaw": {
+      "venue": "lisek-srodmiescie",
+      "requested": 5,
+      "coverage": 5,
+      "correct": 4,
+      "traps": 1,
+      "trapsFlagged": 1,
+      "falseAlarms": 0,
       "unmatched": 0,
       "score": 0.8
     },
@@ -33,12 +50,16 @@
       "coverage": 5,
       "correct": 3,
       "traps": 2,
+      "trapsFlagged": 2,
+      "falseAlarms": 0,
       "unmatched": 0,
       "score": 0.6
     }
   },
   "overall": {
-    "score": 0.55,
-    "traps": 6
+    "score": 0.6,
+    "traps": 7,
+    "trapsFlagged": 7,
+    "falseAlarms": 0
   }
 }

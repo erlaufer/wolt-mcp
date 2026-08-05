@@ -49,6 +49,15 @@ const RULES = {
     { accept: /(onion|sipuli)/i, reject: /(fried|paistett|rapea|crispy|rings|renkaat|jauhe|powder|kastike|sauce|keitto|soup|säilyke|pickled|purkki|jar)/i },
     { accept: /(olive oil|oliiviöljy)/i, reject: /(glass|lasi|saippua|soap|levite|spread|snack|olives|oliivit)/i }
   ],
+  // Held-out market — rules written from what the ingredients mean, before
+  // looking at what the planner picked.
+  warsaw: [
+    { accept: /(makaron|spaghetti|spagetti|penne)/i, reject: /(sos|zupa|danie|krem)/i },
+    { accept: /pomidor/i, reject: /(przecier|koncentrat|sos|ketchup|zupa|pesto|suszon|sok|krem)/i },
+    { accept: /(parmezan|parmigiano|grana padano)/i, reject: /(sos|pesto|krem)/i },
+    { accept: /cebul/i, reject: /(prażon|zupa|proszek|sos|marynowan|suszon|krem)/i },
+    { accept: /oliw/i, reject: /(mydł|spray|krem)/i }
+  ],
   athens: [
     { accept: /(ζυμαρικ|μακαρόν|σπαγγέτ)/i, reject: /(σάλτσα|πέστο|σούπα|έτοιμ)/i },
     { accept: /(ντομάτ|τομάτ)/i, reject: /(πέστο|σάλτσα|χυμ|κέτσαπ|λιαστ|σούπα|πουρέ|πελτέ)/i },
@@ -80,16 +89,22 @@ for (const [name, market] of Object.entries(MARKETS)) {
   const plan = out.pinnedPlan;
   const rules = RULES[name];
   const total = market.ingredients.length;
-  let correct = 0, traps = 0;
+  let correct = 0, traps = 0, trapsFlagged = 0, falseAlarms = 0;
 
   for (const li of plan?.lineItems || []) {
     const i = market.ingredients.indexOf(li.ingredient);
     const rule = rules[i];
     const bad = rule.reject.test(li.name) || JUNK.test(li.name);
     const good = rule.accept.test(li.name) && !bad;
+    const flagged = li.confidence === "low";
     if (good) correct++;
     if (bad) traps++;
-    detail.push([name, li.ingredient, good ? "ok  " : bad ? "TRAP" : "miss", li.name.slice(0, 46)]);
+    // Does the plan's own confidence flag find the wrong picks, and how often
+    // does it cry wolf over a good one? A flag nobody can trust is worse than
+    // no flag: it trains the model to ignore it.
+    if (bad && flagged) trapsFlagged++;
+    if (good && flagged) falseAlarms++;
+    detail.push([name, li.ingredient, good ? "ok  " : bad ? "TRAP" : "miss", (flagged ? "[flagged] " : "") + li.name.slice(0, 46)]);
   }
   for (const m of plan?.missing || []) detail.push([name, m, "--  ", "(no match)"]);
 
@@ -99,14 +114,19 @@ for (const [name, market] of Object.entries(MARKETS)) {
     coverage: plan?.lineItems.length ?? 0,
     correct,
     traps,
+    trapsFlagged,
+    falseAlarms,
     unmatched: plan?.unmatched.length ?? 0,
     score: Number((correct / total).toFixed(3))
   };
 }
 
+const sum = (k) => Object.values(results).reduce((s, r) => s + r[k], 0);
 const overall = {
   score: Number((Object.values(results).reduce((s, r) => s + r.score, 0) / Object.keys(results).length).toFixed(3)),
-  traps: Object.values(results).reduce((s, r) => s + r.traps, 0)
+  traps: sum("traps"),
+  trapsFlagged: sum("trapsFlagged"),
+  falseAlarms: sum("falseAlarms")
 };
 
 // --- report ----------------------------------------------------------------
@@ -128,6 +148,7 @@ for (const [name, r] of Object.entries(results)) {
   );
 }
 console.log(`\n  OVERALL score ${overall.score.toFixed(3)}${delta(overall.score, base?.overall?.score)}   traps ${overall.traps}${delta(overall.traps, base?.overall?.traps)}`);
+console.log(`  confidence flag: caught ${overall.trapsFlagged}/${overall.traps} wrong picks, cried wolf on ${overall.falseAlarms}/${sum("correct")} good ones`);
 if (!base) console.log("  (no baseline yet — run with --save to record one)");
 
 if (process.argv.includes("--save")) {

@@ -97,8 +97,22 @@ export async function planAtVenue(venue_slug, ingredients) {
   for (const { raw, hits, ranked } of resolved) {
     const best = ranked[0];
     if (best) {
+      // Say how sure the pick is, and why not. Token similarity cannot tell
+      // parmesan cheese from parmesan pasta sauce — both match the word — so
+      // an auto-pick that adds a form word, or that only covers part of the
+      // ingredient, is reported as uncertain rather than asserted. The model
+      // reading this can judge by meaning, which is the one thing it can do
+      // here that the server can't.
+      const partial = best.recall < 1;
+      const check = best.addedForm
+        ? `names a form the line didn't ask for ("${best.addedForm}") — confirm it isn't a sauce/snack/derivative version`
+        : partial
+          ? "only part of the ingredient matched by name — confirm it's the right product"
+          : null;
       lineItems.push({
         ingredient: raw, name: best.name, itemId: best.itemId, price: best.price,
+        confidence: check ? "low" : "high",
+        ...(check ? { check } : {}),
         ...(best.isWeighted ? { isWeighted: true, sellByWeight: best.sellByWeight } : {}),
         alternatives: ranked.slice(1).map((c) => ({ name: c.name, itemId: c.itemId, price: c.price }))
       });
@@ -142,9 +156,19 @@ export async function planAtVenue(venue_slug, ingredients) {
 
 export function planResponse(plan, total) {
   const lowCoverage = plan.coverageCount < Math.ceil(total * 0.7);
+  const uncertain = plan.lineItems.filter((li) => li.confidence === "low");
   return {
     venue: plan.venue,
     coverage: `${plan.coverageCount}/${total}`,
+    // Coverage counts lines filled, not lines filled CORRECTLY. These are the
+    // ones most likely to be the wrong product, so they get named rather than
+    // buried in the list.
+    ...(uncertain.length
+      ? {
+          verifyBeforeWriting: uncertain.map((li) => ({ ingredient: li.ingredient, picked: li.name, why: li.check })),
+          verifyNote: "These picks are token-similarity guesses, not judgments. Read each one's name and alternatives and decide by meaning before add_to_cart — swap in a better alternative, search_products for another, or tell the user the item is unavailable. Never write a line you wouldn't defend to the user."
+        }
+      : {}),
     ...(plan.languageNote ? { languageNote: plan.languageNote, retryInLanguage: plan.retryInLanguage } : {}),
     ...(plan.searchErrors
       ? {
