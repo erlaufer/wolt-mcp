@@ -83,6 +83,7 @@ a silent pricing bug, not a recoverable one.
 ## Testing
 
 - `npm test` — offline unit tests (no network, no credentials), including a release guard that package.json, manifest.json and the lockfile carry the same version.
+- `node test/replay.test.mjs` (part of `npm test`) — plans a full shopping list against **recorded catalogs** in three markets, with global `fetch` disabled so a pass can't depend on Wolt being up. Covers store racing, in-venue matching, catalog language, currency resolution and basket assembly. Cassettes are recorded by `node test/record-cassette.mjs`; recording refuses any non-catalog endpoint, so a fixture can never contain account, order or auth traffic. Both the recorder and the test drive the same flow (`test/plan-flow.mjs`), so they cannot silently diverge.
 - `node test/mcp.live.mjs` — lower-level live check of the lib layer directly (refresh → search → basket write → merge/persist verification → cleanup), bypassing the MCP protocol. Needs real credentials and writes a temporary basket to your account.
 - `node mcp/test/tools.live.mjs` — drives every tool through a real stdio MCP client against a live account. Cart tests use a temporary basket and clean up; favorites tests are self-reversing; `set_wolt_token` round-trips the tokens already on disk rather than writing a dummy. A coverage guard compares the tools actually called against `listTools()` and fails the run on any gap, so a newly added tool can't go untested. Only `login_via_chrome` is skipped, being interactive.
 
