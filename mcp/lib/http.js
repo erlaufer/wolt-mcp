@@ -24,7 +24,16 @@ let inFlight = 0;
 let nextStartAt = 0;
 let pausedUntil = 0;
 
+// A process-wide fetch override, for cassette record/replay in tests. Every
+// Wolt request in the server funnels through here, so installing one hook
+// captures (or serves) all of them — no per-call-site plumbing. While a hook
+// is installed the pacing sleeps are skipped: a replay talks to a JSON file,
+// so real-world spacing would only add dead time and timer nondeterminism.
+let injectedFetch = null;
+export function setFetchImpl(fn) { injectedFetch = fn || null; }
+
 async function acquire() {
+  if (injectedFetch) { inFlight++; return; }
   for (;;) {
     const now = Date.now();
     const wait = Math.max(nextStartAt - now, pausedUntil - now, 0);
@@ -49,11 +58,12 @@ function retryAfterMs(res) {
 // Returns { ok, status, json, text }. Throws only on missing-token (with the
 // user-facing setup guidance from auth.js) or network-level failure.
 // retry429Ms is injectable so tests don't sleep through real backoffs.
-export async function woltFetch(url, { method = "GET", body = null, lang = "en", auth = true, fetchImpl = fetch, retry429Ms = RETRY_429_MS } = {}) {
+export async function woltFetch(url, { method = "GET", body = null, lang = "en", auth = true, fetchImpl = null, retry429Ms = RETRY_429_MS } = {}) {
+  const impl = fetchImpl || injectedFetch || fetch;
   const doFetch = async (token) => {
     await acquire();
     try {
-      return await fetchImpl(url, {
+      return await impl(url, {
         method,
         headers: woltHeaders({ token, json: body != null, lang }),
         body: body != null ? JSON.stringify(body) : undefined

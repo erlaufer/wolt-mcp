@@ -1,5 +1,6 @@
 // Wolt search + store-selection + basket building.
 // Search is unauthenticated (no bearer token needed); only the cart write is.
+import { woltFetch } from "./http.js";
 
 const SEARCH_URL = "https://restaurant-api.wolt.com/v1/pages/search";
 const BASKET_URL = "https://consumer-api.wolt.com/order-xp/v1/baskets";
@@ -44,15 +45,25 @@ export function resolveCurrency({ currency = null, venue = null, candidates = []
 // Search items near a location. Returns normalized candidates.
 // mode: "grocery" (default, drops restaurant dishes) or "restaurant" (dishes only).
 // fetchImpl lets tests/extension inject a fetch (default global fetch).
-export async function searchItems(query, { lat, lon, lang = "en", mode = "grocery", fetchImpl = fetch } = {}) {
-  const res = await fetchImpl(SEARCH_URL, {
+// Goes through woltFetch like everything else: search is the widest fan-out in
+// the server (one call per ingredient in plan_cart's first pass), so it has to
+// sit under the same process-wide rate limiter and 429 ladder. It was the one
+// path that didn't, which is what made planning bursts trip Wolt's limits.
+// auth: false keeps it tokenless — searching never needs a login.
+export async function searchItems(query, { lat, lon, lang = "en", mode = "grocery", fetchImpl = undefined } = {}) {
+  const r = await woltFetch(SEARCH_URL, {
     method: "POST",
-    headers: { "content-type": "application/json", "app-language": lang },
-    body: JSON.stringify({ q: query, target: "items", lat, lon })
+    body: { q: query, target: "items", lat, lon },
+    lang,
+    auth: false,
+    ...(fetchImpl ? { fetchImpl } : {})
   });
-  if (!res.ok) throw new Error(`search failed: HTTP ${res.status}`);
-  const json = await res.json();
-  return normalizeSearchResponse(json, { mode });
+  if (!r.ok) {
+    const err = new Error(`search failed: HTTP ${r.status}`);
+    err.status = r.status; // lets plan-level accounting tell 429 from the rest
+    throw err;
+  }
+  return normalizeSearchResponse(r.json || {}, { mode });
 }
 
 export function normalizeSearchResponse(json, { mode = "grocery" } = {}) {
