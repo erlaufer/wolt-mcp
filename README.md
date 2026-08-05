@@ -4,6 +4,8 @@
 
 > "Add the ingredients for carbonara to my cart" · "Order my usual from that burger place" · "What's good and open near me right now?" · "How much will my basket cost with delivery?"
 
+![Demo: Claude plans 4 high-protein dinners, fills a Wolt grocery cart at one store via wolt-mcp, and shows a checkout preview with the real total](docs/wolt-mcp-demo.gif)
+
 ## Install
 
 **Claude Desktop** — download the `.mcpb` bundle from [Releases](../../releases/latest) and double-click it.

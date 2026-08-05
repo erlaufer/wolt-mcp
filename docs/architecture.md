@@ -69,11 +69,24 @@ Option groups need a join: an item's `options[]` are *bindings* (`{id, option_id
 
 `POST /order-xp/web/v2/pages/checkout` prices a basket without ordering. Each menu item must carry a `category_id`, resolved from the venue assortment, then per-item venue pages, and finally falling back to the item id itself (which Wolt accepts). Response rows nest amounts as `{amount, formatted_amount}`.
 
+## Currency
+
+Every basket write and checkout preview carries an explicit currency, and
+search payloads carry a country but not always a currency. `resolveCurrency()`
+in `mcp/lib/wolt.js` walks the sources in order of reliability — the caller's
+value, the venue record, any search candidate that has one, then a
+country → currency table covering Wolt's markets — and returns `null` when none
+of them knows. Callers then refuse the write with a message asking for a
+currency. Nothing defaults to a particular market's money: a wrong currency is
+a silent pricing bug, not a recoverable one.
+
 ## Testing
 
 - `npm test` — offline unit tests (no network, no credentials), including a release guard that package.json, manifest.json and the lockfile carry the same version.
 - `node test/mcp.live.mjs` — lower-level live check of the lib layer directly (refresh → search → basket write → merge/persist verification → cleanup), bypassing the MCP protocol. Needs real credentials and writes a temporary basket to your account.
 - `node mcp/test/tools.live.mjs` — drives every tool through a real stdio MCP client against a live account. Cart tests use a temporary basket and clean up; favorites tests are self-reversing; `set_wolt_token` round-trips the tokens already on disk rather than writing a dummy. A coverage guard compares the tools actually called against `listTools()` and fails the run on any gap, so a newly added tool can't go untested. Only `login_via_chrome` is skipped, being interactive.
+
+Release steps (version bump, `.mcpb` build, publish, post-publish verification) live in [releasing.md](releasing.md).
 
 ## Known limitations
 

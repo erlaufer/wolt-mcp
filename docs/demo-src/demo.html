@@ -1,0 +1,137 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { width:720px; height:720px; overflow:hidden; }
+  body {
+    font-family: "SF Mono", ui-monospace, Menlo, Monaco, monospace;
+    font-size:14px; line-height:1.55;
+    background:#ffffff; color:#1a1a1a;
+    display:flex; flex-direction:column;
+  }
+  /* window chrome */
+  .hdr {
+    flex:0 0 40px; display:flex; align-items:center; gap:8px;
+    padding:0 16px; background:#f4f4f2; border-bottom:1px solid #e2e2df;
+  }
+  .hdr .dots { display:flex; gap:7px; }
+  .hdr .dots i { width:11px; height:11px; border-radius:50%; display:block; }
+  .hdr .dots i:nth-child(1){ background:#e6e6e3 } .hdr .dots i:nth-child(2){ background:#e6e6e3 } .hdr .dots i:nth-child(3){ background:#e6e6e3 }
+  .hdr .title { font-size:12.5px; color:#8a8a86; margin:0 auto; }
+
+  .term { flex:1; overflow:hidden; padding:22px 28px; }
+  .line { white-space:pre; display:none; }
+  .line.on { display:block; }
+
+  .dim   { color:#8a8a86; }
+  .dot   { color:#2f9e5f; }      /* tool bullet — the one accent */
+  .b     { font-weight:700; }
+  .caret { display:inline-block; width:8px; height:16px; background:#1a1a1a; vertical-align:text-bottom; }
+
+  /* end card */
+  .end {
+    position:fixed; inset:0; background:#ffffff; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; gap:10px; opacity:0;
+  }
+  .end .logo { font-size:34px; font-weight:700; color:#1a1a1a; letter-spacing:-.01em; }
+  .end .tag2 { font-size:15px; color:#55555:2; color:#555552; }
+  .end .gh { margin-top:14px; font-size:14px; color:#1a1a1a; border:1px solid #d8d8d4; background:#fafaf8; padding:8px 18px; border-radius:6px; }
+  .end .note { font-size:12px; color:#8a8a86; margin-top:14px; }
+</style>
+</head>
+<body>
+  <div class="hdr">
+    <div class="dots"><i></i><i></i><i></i></div>
+    <div class="title">claude — wolt-mcp</div>
+  </div>
+
+  <div class="term" id="term"></div>
+
+  <div class="end" id="end">
+    <div class="logo">wolt-mcp</div>
+    <div class="tag2">Use Wolt from your favorite AI tool</div>
+    <div class="gh">github.com/erlaufer/wolt-mcp</div>
+    <div class="note">open source · MIT · unofficial — not affiliated with Wolt</div>
+  </div>
+
+<script>
+const PROMPT = "Plan me 4 high-protein dinners for the week and get the groceries on Wolt";
+
+// script: [time_ms, html]  — html '' means blank line
+const TYPE_START = 400, TYPE_END = 2900, ENTER = 3200;
+const S = [];
+let t = ENTER + 600;
+function push(html, dt){ S.push([t, html]); t += dt; }
+
+push('', 0);
+push('<span class="dot">⏺</span> wolt-mcp · search_products("chicken breast")', 700);
+push('  <span class="dim">⎿  14 matches</span>', 500);
+push('<span class="dot">⏺</span> wolt-mcp · search_products("salmon fillet")', 700);
+push('  <span class="dim">⎿  9 matches</span>', 500);
+push('<span class="dot">⏺</span> wolt-mcp · plan_cart(23 items)', 900);
+push('  <span class="dim">⎿  23/23 matched at K-Citymarket — one store</span>', 900);
+push('', 0);
+push('<span class="dot">⏺</span> Here\'s your week — all four over 40 g protein:', 800);
+push('', 0);
+push('    1. Teriyaki salmon &amp; rice bowls   <span class="dim">44 g</span>', 260);
+push('    2. Chicken fajitas                <span class="dim">47 g</span>', 260);
+push('    3. Lentil bolognese               <span class="dim">41 g</span>', 260);
+push('    4. Halloumi grain bowls           <span class="dim">42 g</span>', 900);
+push('', 0);
+push('  Cart at K-Citymarket:', 500);
+push('    Salmon fillet 500 g              €9.85', 220);
+push('    Chicken breast 1 kg             €11.90', 220);
+push('    Red lentils 500 g                €2.35', 220);
+push('    Halloumi 2 × 200 g               €6.50', 220);
+push('    <span class="dim">+ 19 more items                 €28.90</span>', 1100);
+push('', 0);
+push('  Checkout preview:', 500);
+push('    Subtotal · 23 items             €59.50', 240);
+push('    Delivery                         €3.90', 240);
+push('    Service fee                      €4.00', 240);
+push('    <span class="b">Total                           €67.40</span>', 1400);
+push('', 0);
+push('<span class="dot">⏺</span> Your basket is filled — <span class="b">you</span> review and check out', 0);
+push('  on wolt.com. Nothing is ever ordered or paid', 0);
+push('  automatically.', 2600);
+
+const END_ON = t;              // end card fades in after last beat
+const TOTAL = END_ON + 3300;
+
+// build DOM once: prompt lines + script lines
+const term = document.getElementById('term');
+const promptEl = document.createElement('div');
+promptEl.className = 'line on';
+term.appendChild(promptEl);
+const lines = S.map(([time, html]) => {
+  const d = document.createElement('div');
+  d.className = 'line';
+  d.innerHTML = html === '' ? '&nbsp;' : html;
+  term.appendChild(d);
+  return { time, el: d };
+});
+
+function el(id){ return document.getElementById(id); }
+
+window.seek = function(ms){
+  // typed prompt with caret
+  const frac = Math.min(1, Math.max(0, (ms - TYPE_START) / (TYPE_END - TYPE_START)));
+  const n = Math.round(frac * PROMPT.length);
+  const caretOn = ms < ENTER + 400 && (Math.floor(ms / 450) % 2 === 0);
+  promptEl.innerHTML = '<span class="dim">&gt;</span> ' + PROMPT.slice(0, n).replace(/&/g,'&amp;')
+    + (caretOn ? '<span class="caret"></span>' : '');
+  promptEl.style.whiteSpace = 'pre-wrap';
+
+  for (const l of lines) l.el.classList.toggle('on', ms >= l.time);
+
+  el('end').style.opacity = Math.min(1, Math.max(0, (ms - END_ON) / 500));
+
+  term.scrollTop = term.scrollHeight;
+};
+window.TOTAL_MS = TOTAL;
+window.FULL_MS = END_ON - 100;   // full transcript visible, end card not yet — used as poster frame
+</script>
+</body>
+</html>

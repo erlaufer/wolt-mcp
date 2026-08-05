@@ -15,37 +15,34 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import {
-  searchItems, selectBestVenue, rankVenues, buildBasketBody, BASKET_URL,
+  searchItems, selectBestVenue, rankVenues, buildBasketBody, reconcileWeightedItems, resolveCurrency, BASKET_URL,
   BASKETS_PAGE_URL, BASKETS_DELETE_URL, isVenueObjectId, findBasketForVenue, mergeBasketItems
 } from "./lib/wolt.js";
 import { woltFetch } from "./lib/http.js";
-import { rankCandidates, tokens } from "./lib/match.js";
+import { rankCandidates } from "./lib/match.js";
 import { parseIngredientLine } from "./lib/recipe.js";
 import { setTokens, describeTokens, getAccessToken } from "./lib/auth.js";
 import { getLocation, setLocation, estimateLocation } from "./lib/config.js";
 import { checkoutPreview } from "./lib/checkout.js";
 import { cdpLogin } from "./lib/cdp-login.js";
-import { getVenue, getMenu, getItemOptions, getCategories, resolveItem, parseItemUrl, searchVenueItems } from "./lib/venue.js";
+import { getVenue, getMenu, getItemOptions, getCategories, resolveItem, parseItemUrl, searchVenueItems, getCatalogLanguage, getMarketLanguage, getWeightConfigs } from "./lib/venue.js";
 import { getOrderHistory, getOrder, geocodeAddress } from "./lib/account.js";
+import { langOf, sameScript, isNonLatinLang } from "./lib/lang.js";
+import { planAtVenue, planResponse, translationPreflight, rankPlans, mapPool } from "./lib/plan.js";
 
-// Detect the (Wolt-market) language a query is written in from its script, so
-// in-venue searches return names in the same language the query uses.
-const SCRIPT_LANGS = [[/[֐-׿]/, "he"], [/[؀-ۿ]/, "ar"], [/[Ѐ-ӿ]/, "ru"], [/[Ͱ-Ͽ]/, "el"], [/[Ⴀ-ჿ]/, "ka"]];
-const langOf = (s) => SCRIPT_LANGS.find(([re]) => re.test(String(s)))?.[1] || "en";
-
-// Map with bounded concurrency — per-ingredient searches are independent HTTP
-// round-trips, and running them serially is what made planning slow.
-async function mapPool(items, limit, fn) {
-  const out = new Array(items.length);
-  let next = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const i = next++;
-      out[i] = await fn(items[i], i);
-    }
-  });
-  await Promise.all(workers);
-  return out;
+// catalogLanguage (+ a hint for non-Latin markets) for tool responses that
+// establish or report the user's location — so the model knows to translate
+// its queries BEFORE the first plan_cart. Best-effort: never throws, {} on
+// unknown, and cached per ~11km bucket so repeat calls are free.
+async function marketLanguageFields(lat, lon) {
+  const language = await getMarketLanguage({ lat, lon });
+  if (!language) return {};
+  return {
+    catalogLanguage: language,
+    ...(isNonLatinLang(language)
+      ? { languageHint: `Write product queries and plan_cart ingredient lines in '${language}' (translate them yourself).` }
+      : {})
+  };
 }
 
 // Resolve coordinates for a tool call: explicit args win, then the saved/env
@@ -139,7 +136,7 @@ const errText = (msg) => ({ content: [{ type: "text", text: msg }], isError: tru
 // reporting a stale one (test/version.test.mjs keeps manifest.json in step).
 const { version: VERSION } = createRequire(import.meta.url)("./package.json");
 const server = new McpServer({ name: "wolt-mcp", version: VERSION }, {
-  instructions: "When the user wants to BUY something (not just browse), call wolt_status FIRST — it live-verifies the Wolt login. If it reports loginNeeded, sort the login out with the user (login_via_chrome, or set_wolt_token on Firefox/Safari) before searching and planning, so the work isn't lost to an expired session mid-checkout. Searching and browsing venues never need a login. For the delivery address: use_saved_address pulls the user's saved Wolt addresses and sets one as the search location (get_wolt_profile does NOT have addresses); a spoken address goes through resolve_address + set_location. Baskets are single-venue: source every item from one store. The fast path for a shopping list is wolt_status -> use_saved_address (if no location) -> ONE plan_cart call (it auto-picks the store and reports runner-up coverage) -> review the matches -> add_to_cart -> checkout_preview. Don't compare stores manually with repeated searches unless the user asks, and never write a lowCoverage plan without agreeing with the user first."
+  instructions: "When the user wants to BUY something (not just browse), call wolt_status FIRST — it live-verifies the Wolt login. If it reports loginNeeded, sort the login out with the user (login_via_chrome, or set_wolt_token on Firefox/Safari) before searching and planning, so the work isn't lost to an expired session mid-checkout. Searching and browsing venues never need a login. For the delivery address: use_saved_address pulls the user's saved Wolt addresses and sets one as the search location (get_wolt_profile does NOT have addresses); a spoken address goes through resolve_address + set_location. Baskets are single-venue: source every item from one store. The fast path for a shopping list is wolt_status -> use_saved_address (if no location) -> ONE plan_cart call (it auto-picks the store and reports runner-up coverage) -> review the matches -> add_to_cart -> checkout_preview. wolt_status and the address tools report the market's catalogLanguage — translate the ingredient list into it BEFORE calling plan_cart (Greek in Greece, Japanese in Japan, Hebrew in Israel, Georgian in Georgia, and so on); plan_cart refuses off-language lists with needsTranslation. Don't compare stores manually with repeated searches unless the user asks, and never write a lowCoverage plan without agreeing with the user first."
 });
 
 // --- search_products: one ingredient -> candidate products (no auth) ---
@@ -147,7 +144,7 @@ server.tool(
   "search_products",
   "Search Wolt grocery products for a single ingredient. Default: searches ALL nearby stores. With venue_slug: searches ONE store's own catalog (needs login; query in the store's language) — use this to check or fix a single item at the store you're building the basket at. For a whole recipe or shopping list, prefer plan_cart — it resolves every ingredient in one call. A basket must be all from ONE venueId. MATCHING RULES when picking: (1) Match the ingredient ITSELF — never a plant-based, vegan, imitation, or flavored substitute unless the user explicitly asked. e.g. 'Redefine Meat'/'plant-based mince' is NOT ground beef; margarine is NOT butter; imitation crab is NOT crab. (2) Do NOT just pick the cheapest — Wolt surfaces cheap 'Substitute Deals' that are often imitation products; prefer the real, mainstream item at a sensible package size. (3) Match the right FORM (crushed tomatoes ≠ tomato paste; ground beef ≠ beef sausage). When unsure, prefer the plainest real version of the actual ingredient.",
   {
-    query: z.string().describe("Product search term, e.g. 'crushed tomatoes' — in the store's catalog language when venue_slug is set"),
+    query: z.string().describe("Product search term, e.g. 'crushed tomatoes' — with venue_slug set, write it in the store's catalogLanguage (returned by get_venue/plan_cart/this tool); translate it yourself if needed"),
     venue_slug: z.string().optional().describe("Search only this store's catalog (the venue you're building the basket at)"),
     lat: z.number().optional().describe("Override latitude; defaults to the saved location"),
     lon: z.number().optional().describe("Override longitude; defaults to the saved location")
@@ -155,18 +152,27 @@ server.tool(
   async ({ query, venue_slug, lat, lon }) => {
     if (venue_slug) {
       try {
-        const venue = await getVenue(venue_slug);
-        const hits = await searchVenueItems(venue_slug, query, { lang: langOf(query) });
+        const [venue, catalogLanguage, hits] = await Promise.all([
+          getVenue(venue_slug),
+          getCatalogLanguage(venue_slug),
+          searchVenueItems(venue_slug, query, { lang: langOf(query) })
+        ]);
         return text({
-          query, venue: { venueId: venue.venueId, slug: venue_slug, name: venue.name, currency: venue.currency },
+          query, venue: { venueId: venue.venueId, slug: venue_slug, name: venue.name, currency: venue.currency, catalogLanguage },
           count: hits.length,
-          items: hits.slice(0, 15).map((c) => ({ itemId: c.itemId, name: c.name, price: c.price }))
+          items: hits.slice(0, 15).map((c) => ({ itemId: c.itemId, name: c.name, price: c.price, ...(c.isWeighted ? { isWeighted: true, sellByWeight: c.sellByWeight } : {}) })),
+          ...(catalogLanguage && isNonLatinLang(catalogLanguage) && !sameScript(query, catalogLanguage)
+            ? { languageNote: `This catalog is indexed in '${catalogLanguage}' and the query isn't — results may be poor or wrong-form. Translate the query to ${catalogLanguage} and retry for better matches.` }
+            : {})
         });
       } catch (e) { return errText(e.message); }
     }
     try {
       ({ lat, lon } = await needLocation(lat, lon));
-      const items = await searchItems(query, { lat, lon, lang: "en" });
+      // Header follows the query's script so result names come back in the
+      // query's language instead of machine-translated (relevance is driven by
+      // the query text itself; the header only controls display names).
+      const items = await searchItems(query, { lat, lon, lang: langOf(query) });
       // Venue metadata goes once into `venues`, not on all 20 items — these
       // responses are read by a model every turn, and the repetition was
       // roughly half the payload.
@@ -197,7 +203,7 @@ server.tool(
   async ({ query, lat, lon }) => {
     try {
       ({ lat, lon } = await needLocation(lat, lon));
-      const items = await searchItems(query, { lat, lon, lang: "en", mode: "restaurant" });
+      const items = await searchItems(query, { lat, lon, lang: langOf(query), mode: "restaurant" });
       const venues = {};
       const top = items.slice(0, 20).map((c) => {
         venues[c.venueId] ||= { name: c.venueName, slug: c.venueSlug, rating: c.venueRating, citySlug: c.citySlug, country: c.country };
@@ -242,91 +248,19 @@ server.tool(
         : addresses.find((a) => a.labelType === "home") || null;
       if (!pick) return text({ addresses, note: "Multiple addresses and none labeled home — ask the user which to use, then call again with address_id." });
       const saved = setLocation({ lat: pick.lat, lon: pick.lon, label: pick.alias ? `${pick.alias} — ${pick.address}` : pick.address });
-      return text({ saved, pickedAddressId: pick.id, addresses });
+      return text({ saved, pickedAddressId: pick.id, addresses, ...(await marketLanguageFields(pick.lat, pick.lon)) });
     } catch (e) {
       return errText(e.message);
     }
   }
 );
 
-// Plan a whole ingredient list against ONE venue's own catalog. Returns the
-// same shape whether called for a pinned store or as one contestant of the
-// multi-store race in plan_cart's auto mode.
-// Markets whose catalogs are indexed in a non-Latin language: querying them in
-// English is the single biggest cause of garbage matches.
-const CATALOG_LANGS = { ISR: "he", GEO: "ka", GRC: "el" };
-
-async function planAtVenue(venue_slug, ingredients) {
-  const venue = await getVenue(venue_slug);
-  const lineItems = [], missing = [], unmatched = [];
-  const resolved = await mapPool(ingredients, 4, async (raw) => {
-    const name = parseIngredientLine(raw).name;
-    const lang = langOf(name);
-    let hits = [];
-    try { hits = await searchVenueItems(venue_slug, name, { lang }); } catch (e) {}
-    // Multi-word queries often miss; the store search wants short terms.
-    if (!hits.length) {
-      const longest = tokens(name).sort((a, b) => b.length - a.length)[0];
-      if (longest && longest !== name) {
-        try { hits = await searchVenueItems(venue_slug, longest, { lang }); } catch (e) {}
-      }
-    }
-    // Only auto-pick scored matches — the raw first hit of a missed query is
-    // garbage (a "shrimp" miss once returned Sprite Zero). Unscorable hits
-    // still go back as candidates for the model to judge — it matches by
-    // meaning, which token overlap can't.
-    return { raw, hits, ranked: rankCandidates(name, hits, { topK: 3, minScore: 0.15 }) };
-  });
-  for (const { raw, hits, ranked } of resolved) {
-    const best = ranked[0];
-    if (best) {
-      lineItems.push({
-        ingredient: raw, name: best.name, itemId: best.itemId, price: best.price,
-        alternatives: ranked.slice(1).map((c) => ({ name: c.name, itemId: c.itemId, price: c.price }))
-      });
-    } else if (hits.length) {
-      unmatched.push({ ingredient: raw, candidates: hits.slice(0, 3).map((c) => ({ name: c.name, itemId: c.itemId, price: c.price })) });
-    } else missing.push(raw);
-  }
-  const basket = lineItems.length
-    ? buildBasketBody(lineItems.map((li) => ({ candidate: { itemId: li.itemId, name: li.name, price: li.price, isWeighted: false }, count: 1 })), venue.venueId, venue.currency || "EUR")
-    : null;
-  const catalogLang = CATALOG_LANGS[(venue.country || "").toUpperCase()];
-  const offLanguage = catalogLang
-    ? ingredients.filter((raw) => langOf(parseIngredientLine(raw).name) !== catalogLang).length
-    : 0;
-  return {
-    venue: { venueId: venue.venueId, slug: venue_slug, name: venue.name, currency: venue.currency },
-    coverageCount: lineItems.length,
-    cost: lineItems.reduce((s, li) => s + (li.price || 0), 0),
-    ...(offLanguage
-      ? { languageNote: `${offLanguage} ingredient line(s) are not in this store's catalog language ('${catalogLang}'). Scored matches for those lines can be wrong-category (e.g. 'brown rice' matching a ramen) — double-check them, and rewrite dubious lines in ${catalogLang} via plan_cart or search_products with venue_slug.` }
-      : {}),
-    lineItems, missing, unmatched, basket
-  };
-}
-
-function planResponse(plan, total) {
-  const lowCoverage = plan.coverageCount < Math.ceil(total * 0.7);
-  return {
-    venue: plan.venue,
-    coverage: `${plan.coverageCount}/${total}`,
-    ...(plan.languageNote ? { languageNote: plan.languageNote } : {}),
-    ...(lowCoverage ? { lowCoverage: true, coverageNote: "Coverage is LOW — tell the user what's missing and agree on a store or substitutions BEFORE writing any basket." } : {}),
-    lineItems: plan.lineItems,
-    missing: plan.missing,
-    ...(plan.unmatched.length ? { unmatched: plan.unmatched, unmatchedNote: "The store returned these candidates but token scoring couldn't confirm them — judge each by meaning and add the good ones to the basket yourself (never a flavored/imitation substitute)." } : {}),
-    basket: plan.basket,
-    ...(plan.missing.length ? { note: "Missing items may just be a language/phrasing miss — retry them in the store's catalog language, or drop them." } : {})
-  };
-}
-
 // --- plan_cart: whole list -> single-store plan, one call ---
 server.tool(
   "plan_cart",
-  "Resolve a whole ingredient list into a single-store cart in ONE call. Without venue_slug it auto-picks: shortlists the best-covering nearby stores and races the list against each store's own catalog, returning the winner plus per-store coverage of the runners-up (evaluatedVenues) — if lowCoverage is flagged, agree with the user before writing anything. With venue_slug it plans against that store only. Write ingredient lines in the store's catalog language (e.g. Hebrew for Israeli stores). Returns line items with alternatives + a ready add_to_cart basket; sanity-check matches before writing.",
+  "Resolve a whole ingredient list into a single-store cart in ONE call. Without venue_slug it auto-picks: shortlists the best-covering nearby stores and races the list against each store's own catalog, returning the winner plus per-store coverage of the runners-up (evaluatedVenues) — if lowCoverage is flagged, agree with the user before writing anything. With venue_slug it plans against that store only. Write ingredient lines in the market's catalog language (reported by wolt_status/set_location/use_saved_address as catalogLanguage — translate them yourself): if most lines are in the wrong script it returns needsTranslation instead of planning — translate and call again. A rateLimited response means Wolt throttled the burst: wait ~30s and retry, don't rephrase. Returns line items with alternatives + a ready add_to_cart basket; sanity-check matches before writing.",
   {
-    ingredients: z.array(z.string()).describe("Ingredient lines, e.g. ['800 g crushed tomatoes', '1 onion'] — use the store's catalog language (e.g. Hebrew for Israeli stores)"),
+    ingredients: z.array(z.string()).describe("Ingredient lines, e.g. ['800 g crushed tomatoes', '1 onion'] — written in the store's catalogLanguage (translate them yourself; the plan response reports it)"),
     venue_slug: z.string().optional().describe("Pin planning to this store instead of auto-picking"),
     lat: z.number().optional().describe("Override latitude; defaults to the saved location"),
     lon: z.number().optional().describe("Override longitude; defaults to the saved location")
@@ -334,45 +268,54 @@ server.tool(
   async ({ ingredients, venue_slug, lat, lon }) => {
     try {
       if (venue_slug) {
+        // Preflight: refuse to burn a whole planning round on off-script lines.
+        const early = translationPreflight(ingredients, await getCatalogLanguage(venue_slug));
+        if (early) return text(early);
         return text(planResponse(await planAtVenue(venue_slug, ingredients), ingredients.length));
       }
       ({ lat, lon } = await needLocation(lat, lon));
+      const early = translationPreflight(ingredients, await getMarketLanguage({ lat, lon }));
+      if (early) return text(early);
       const perIngredient = await mapPool(ingredients, 6, async (raw) => {
         const q = parseIngredientLine(raw).name;
         let candidates = [];
-        try { candidates = await searchItems(q, { lat, lon, lang: "en" }); } catch (e) {}
+        try { candidates = await searchItems(q, { lat, lon, lang: langOf(q) }); } catch (e) {}
         return { ingredient: raw, spec: { query: q }, candidates: rankCandidates(q, candidates) };
       });
-      // In-venue planning needs a token; without one, fall back to the pure
-      // global-search pick rather than failing.
-      let hasToken = true;
-      try { await getAccessToken(); } catch (e) { hasToken = false; }
-      if (hasToken) {
-        const shortlist = rankVenues(perIngredient).slice(0, 5).filter((r) => r.venue.venueSlug);
-        if (shortlist.length) {
-          const plans = (await mapPool(shortlist, 5, async (r) => {
-            try { return await planAtVenue(r.venue.venueSlug, ingredients); } catch (e) { return null; }
-          })).filter(Boolean);
-          if (plans.length) {
-            // Coverage always beats price: a cheap 2/10 store is not a plan.
-            plans.sort((a, b) => b.coverageCount - a.coverageCount || a.cost - b.cost);
-            const best = plans[0];
-            return text({
-              ...planResponse(best, ingredients.length),
-              evaluatedVenues: plans.map((p) => ({ name: p.venue.name, slug: p.venue.slug, coverage: `${p.coverageCount}/${ingredients.length}` }))
-            });
+      // In-venue planning is tokenless — every user gets the full store race.
+      // Top 3 by global coverage: the winner is overwhelmingly in there, and 5
+      // venues' searches were half of the burst that got us rate-limited.
+      const shortlist = rankVenues(perIngredient).slice(0, 3).filter((r) => r.venue.venueSlug);
+      if (shortlist.length) {
+        const plans = (await mapPool(shortlist, 3, async (r) => {
+          try { return await planAtVenue(r.venue.venueSlug, ingredients); } catch (e) { return null; }
+        })).filter(Boolean);
+        if (plans.length) {
+          // Coverage always beats price, and a half-degraded plan can't win —
+          // its coverage number is a lie, not a store comparison.
+          const { best, allDegraded } = rankPlans(plans, ingredients.length);
+          if (allDegraded) {
+            return text({ rateLimited: true, note: "Wolt rate-limited the planning burst. Wait ~30 seconds and call plan_cart again, or pin one store with venue_slug." });
           }
+          return text({
+            ...planResponse(best, ingredients.length),
+            evaluatedVenues: plans.map((p) => ({
+              name: p.venue.name, slug: p.venue.slug, coverage: `${p.coverageCount}/${ingredients.length}`,
+              ...(p.searchErrors ? { searchErrors: p.searchErrors } : {})
+            }))
+          });
         }
       }
       const { venue, chosen, missing } = selectBestVenue(perIngredient);
       if (!venue) return text({ venue: null, missing, note: "No store covered these ingredients." });
-      const basket = buildBasketBody(chosen.map((c) => ({ candidate: c.candidate, count: 1 })), venue.venueId, chosen[0]?.candidate.currency || "ILS");
+      const currency = resolveCurrency({ candidates: chosen.map((c) => c.candidate), country: venue.country });
       return text({
         venue,
         coverage: `${chosen.length}/${ingredients.length}`,
         lineItems: chosen.map((c) => ({ ingredient: c.ingredient, name: c.candidate.name, itemId: c.candidate.itemId, price: c.candidate.price, isWeighted: c.candidate.isWeighted })),
         missing,
-        basket
+        basket: currency ? buildBasketBody(chosen.map((c) => ({ candidate: c.candidate, count: 1 })), venue.venueId, currency) : null,
+        ...(currency ? {} : { basketNote: "No currency on record for this venue — call add_to_cart with an explicit currency taken from search_products results." })
       });
     } catch (e) {
       return errText(`plan failed: ${e.message}`);
@@ -383,13 +326,13 @@ server.tool(
 // --- add_to_cart: write the basket (needs WOLT_BEARER_TOKEN) ---
 server.tool(
   "add_to_cart",
-  "Write items to the user's Wolt basket for one venue. All items must share the venue_id. Needs login (if wolt_status says loginNeeded, do that first). Returns a checkoutUrl — give it to the user, and call checkout_preview for the real total including fees. Nothing is ever ordered automatically; the user reviews and pays on wolt.com.",
+  "Write items to the user's Wolt basket for one venue. All items must share the venue_id. Needs login (if wolt_status says loginNeeded, do that first). ALWAYS pass venue_slug: it lets each line's weighted flag be reconciled against how the catalog actually sells the item — items named '~900 g pack' are often COUNT items, truly weighted items only accept multiples of their gramsPerStep, and either mismatch is silently dropped by Wolt. Corrections made are reported as `adjustments`. The response also re-reads the basket and reports droppedLines for anything Wolt still discarded — treat those as NOT added. Returns a checkoutUrl — give it to the user, and call checkout_preview for the real total including fees. Nothing is ever ordered automatically; the user reviews and pays on wolt.com.",
   {
     venue_id: z.string(),
     venue_slug: z.string().optional().describe("venueSlug from search results — used to build the checkout link"),
     city_slug: z.string().optional().describe("citySlug from search results"),
-    country: z.string().optional().describe("3-letter country from search results, e.g. 'isr'"),
-    currency: z.string().optional().describe("Currency from search results (e.g. 'ILS', 'EUR'); resolved from the venue if omitted"),
+    country: z.string().optional().describe("3-letter country from search results, e.g. 'fin', 'deu', 'jpn'"),
+    currency: z.string().optional().describe("Currency from search results (e.g. 'EUR', 'SEK', 'PLN'); resolved from the venue if omitted"),
     items: z.array(z.object({
       id: z.string(),
       name: z.string(),
@@ -414,14 +357,26 @@ server.tool(
       return errText(`venue_id "${venue_id}" is not a Wolt venue id (24 hex chars). Use the venueId field from search_products — not the venue slug — or the item was NOT added.`);
     }
     try {
-      // Resolve currency/country from the venue when not supplied (keeps the
-      // tool country-agnostic; ILS only as a last-resort fallback).
+      // Resolve currency/country from the venue when not supplied, then from
+      // the venue's market — never from a hardcoded default, which would price
+      // one market's basket in another's money.
       let venueInfo = null;
       if (venue_slug && (!currency || !country)) {
         try { venueInfo = await getVenue(venue_slug); } catch (e) {}
       }
-      currency = currency || venueInfo?.currency || "ILS";
       country = country || venueInfo?.country?.toLowerCase() || null;
+      currency = resolveCurrency({ currency, venue: venueInfo, country });
+      if (!currency) {
+        return errText(`can't tell which currency this venue prices in, so nothing was written. Pass currency (the value from the search_products results, e.g. 'EUR') — and venue_slug, if you have it — and call add_to_cart again.`);
+      }
+      // The caller's weighted flag is a guess (names like "~900 g pack" read
+      // as weighted but are count items, and vice versa). Reconcile every
+      // line against how the catalog actually sells it, and snap weighted
+      // grams onto the item's step — either kind of mismatch is a line Wolt
+      // accepts and then silently repairs or removes.
+      const adjustments = venue_slug
+        ? reconcileWeightedItems(items, await getWeightConfigs(venue_slug, items.map((it) => it.id)))
+        : [];
       let body = buildBasketBody(
         items.map((it) => ({ candidate: { itemId: it.id, name: it.name, price: it.price, isWeighted: it.weighted }, count: it.count, grams: it.grams || undefined, options: it.options })),
         venue_id, currency
@@ -439,6 +394,26 @@ server.tool(
       } catch (e) { /* best effort — a fresh basket write is still correct */ }
       const r = await woltFetch(BASKET_URL, { method: "POST", body });
       if (!r.ok) return errText(`cart write failed: HTTP ${r.status} ${r.text.slice(0, 300)}`);
+      // Read-after-write: Wolt's basket POST returns success even for lines it
+      // silently discards (invalid weight, unavailable item). Re-read the
+      // basket and diff, so "ok" is never claimed for a line that isn't there.
+      let verification = {};
+      try {
+        const loc = getLocation();
+        if (loc) {
+          const after = findBasketForVenue(await getBasketsPage(loc.lat, loc.lon), venue_id);
+          const present = new Set((after?.items || []).map((i) => i.id));
+          const dropped = items.filter((it) => !present.has(it.id)).map((it) => it.name);
+          verification = {
+            verified: true,
+            linesInBasket: (after?.items || []).length,
+            ...(dropped.length ? {
+              droppedLines: dropped,
+              droppedNote: "Wolt accepted the write but silently DROPPED these lines — usually an invalid weight (must be a multiple of the item's gramsPerStep) or an unavailable item. They are NOT in the cart: fix and re-add them, and don't tell the user they're included."
+            } : {})
+          };
+        }
+      } catch (e) { /* verification is best-effort; the write itself succeeded */ }
       let checkoutUrl = "https://wolt.com";
       if (venue_slug && country && city_slug) {
         checkoutUrl = `https://wolt.com/en/${country}/${city_slug}/venue/${venue_slug}`;
@@ -448,7 +423,13 @@ server.tool(
         try { checkoutUrl = (await getVenue(venue_slug)).shareUrl || checkoutUrl; } catch (e) {}
         if (checkoutUrl === "https://wolt.com") checkoutUrl = `https://wolt.com/search?q=${encodeURIComponent(venue_slug)}`;
       }
-      return text({ ok: true, status: r.status, basketId: r.json?.id ?? null, itemsWritten: items.length, existingLinesPreserved: mergedFromExisting, checkoutUrl, note: `Basket written. Give the user this link to review and check out: ${checkoutUrl}. Then call checkout_preview for the delivery-included total.` });
+      return text({
+        ok: true, status: r.status, basketId: r.json?.id ?? null, itemsWritten: items.length, existingLinesPreserved: mergedFromExisting,
+        ...(adjustments.length ? { adjustments } : {}),
+        ...verification,
+        checkoutUrl,
+        note: `Basket written. Give the user this link to review and check out: ${checkoutUrl}. Then call checkout_preview for the delivery-included total.`
+      });
     } catch (e) {
       return errText(e.message);
     }
@@ -499,10 +480,13 @@ server.tool(
 // --- get_venue: detail + hours (slug-cached 24h) ---
 server.tool(
   "get_venue",
-  "Venue details by slug (from search results): rating, address, currency, delivery price, and opening hours per day with timezone. Check hours before adding food from a restaurant that might be closed.",
+  "Venue details by slug (from search results): rating, address, currency, delivery price, opening hours per day with timezone, and catalogLanguage (the language the venue's catalog is indexed in — query/plan in it for best matches). Check hours before adding food from a restaurant that might be closed.",
   { venue_slug: z.string() },
   async ({ venue_slug }) => {
-    try { return text(await getVenue(venue_slug)); } catch (e) { return errText(e.message); }
+    try {
+      const [venue, catalogLanguage] = await Promise.all([getVenue(venue_slug), getCatalogLanguage(venue_slug)]);
+      return text({ ...venue, catalogLanguage });
+    } catch (e) { return errText(e.message); }
   }
 );
 
@@ -824,7 +808,12 @@ server.tool(
       const items = mergeBasketItems(count === 0 ? remaining : basket.items, [])
         .map((it) => (it.id === item_id ? { ...it, count } : it))
         .filter((it) => it.count > 0);
-      const body = { items, venue_id, currency: basket.currency || "ILS" };
+      // The basket's own currency is authoritative here; the venue's market is
+      // the fallback. Rewriting a basket in a guessed currency is worse than
+      // failing loudly.
+      const currency = resolveCurrency({ currency: basket.currency, country: basket.venue?.country });
+      if (!currency) return errText(`basket ${basket.id} has no currency on record and the venue's market is unknown — nothing was changed. Re-add the line with add_to_cart (passing currency) instead.`);
+      const body = { items, venue_id, currency };
       const r = await woltFetch(BASKET_URL, { method: "POST", body });
       if (!r.ok) return errText(`cart update failed: HTTP ${r.status} ${r.text.slice(0, 300)}`);
       return text({ ok: true, itemId: item_id, newCount: count, linesNow: items.length, note: count === 0 ? "Line removed. Verify with get_baskets — if the line reappears, Wolt may not support removing single lines from multi-line baskets server-side." : "Count updated." });
@@ -895,24 +884,26 @@ server.tool(
     lon: z.number().describe("Longitude"),
     label: z.string().optional().describe("Human-readable place, e.g. 'Aleksanterinkatu 1, Helsinki'")
   },
-  async ({ lat, lon, label }) => text({ saved: setLocation({ lat, lon, label }) })
+  async ({ lat, lon, label }) => text({ saved: setLocation({ lat, lon, label }), ...(await marketLanguageFields(lat, lon)) })
 );
 
 // --- wolt_status: live login check + location ---
 server.tool(
   "wolt_status",
-  "Call this FIRST whenever the user wants to buy or manage their account: it live-verifies the Wolt login (refreshing the access token if needed) and reports the configured location. If loginNeeded is true, offer login_via_chrome (or set_wolt_token) before planning a cart. Search works without a token.",
+  "Call this FIRST whenever the user wants to buy or manage their account: it live-verifies the Wolt login (refreshing the access token if needed) and reports the configured location plus the market's catalogLanguage — write product queries and plan_cart ingredient lines in that language (translate them yourself). If loginNeeded is true, offer login_via_chrome (or set_wolt_token) before planning a cart. Search works without a token.",
   async () => {
     // Actually exercise the token chain instead of reporting what's on disk —
     // a stored refresh token can be stale, and finding that out here beats
     // finding out after the cart is planned.
     let loginNeeded = false, loginDetail = null;
     try { await getAccessToken(); } catch (e) { loginNeeded = true; loginDetail = e.message; }
+    const loc = getLocation();
     return text({
       loginNeeded,
       ...(loginDetail ? { loginDetail } : {}),
       ...describeTokens(),
-      location: getLocation() || { label: "not set (estimated from IP on first search)", hint: "use_saved_address sets it from the user's saved Wolt addresses; set_location takes a spoken address" }
+      location: loc || { label: "not set (estimated from IP on first search)", hint: "use_saved_address sets it from the user's saved Wolt addresses; set_location takes a spoken address" },
+      ...(loc ? await marketLanguageFields(loc.lat, loc.lon) : {})
     });
   }
 );

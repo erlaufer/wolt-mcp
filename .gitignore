@@ -6,3 +6,5 @@ node_modules/
 # local credential stores — never commit
 tokens.json
 .wolt-mcp/
+# demo render output
+docs/demo-src/frames/

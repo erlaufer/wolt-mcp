@@ -6,7 +6,8 @@
 // fallback); as a last resort we fall back to the item id itself, which
 // the endpoint accepts.
 import { woltFetch } from "./http.js";
-import { BASKETS_PAGE_URL, findBasketForVenue } from "./wolt.js";
+import { BASKETS_PAGE_URL, findBasketForVenue, resolveCurrency } from "./wolt.js";
+import { getVenue } from "./venue.js";
 
 const CHECKOUT_URL = "https://consumer-api.wolt.com/order-xp/web/v2/pages/checkout";
 const ASSORTMENT_BASE = "https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/";
@@ -45,7 +46,7 @@ async function tryFetchJson(url, opts) {
 
 // Preview checkout for the user's existing basket at one venue.
 // Returns { payableAmount, rows, deliveryConfigs, offers, warnings, raw }.
-export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, country = "ISR", tip = 0, promoCode = null }) {
+export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, country = null, tip = 0, promoCode = null }) {
   const warnings = [];
   const pageRes = await woltFetch(`${BASKETS_PAGE_URL}?lat=${lat}&lon=${lon}`);
   if (!pageRes.ok) throw new Error(`baskets fetch failed: HTTP ${pageRes.status}`);
@@ -55,7 +56,23 @@ export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, cou
   const venue = basket.venue || {};
   const resolvedVenueId = venue.id || venueId;
   const slug = venueSlug || venue.slug || venue.venue_slug || venue.public_slug || venue.url_slug || null;
-  const currency = basket.currency || venue.currency || "ILS";
+
+  // Currency and country come off the basket/venue, and from the venue record
+  // when the baskets page carries neither — the preview payload prices the
+  // whole order, so a guessed market here would quote the wrong money.
+  let currency = basket.currency || venue.currency || null;
+  let venueCountry = venue.country || country || null;
+  if ((!currency || !venueCountry) && slug) {
+    try {
+      const detail = await getVenue(slug);
+      currency = currency || detail.currency;
+      venueCountry = venueCountry || detail.country;
+    } catch (e) { /* best effort — the map below may still resolve it */ }
+  }
+  currency = resolveCurrency({ currency, country: venueCountry });
+  if (!currency || !venueCountry) {
+    throw new Error(`cannot price this basket: ${!currency ? "currency" : "country"} unknown for venue ${resolvedVenueId}${slug ? ` (${slug})` : ""}`);
+  }
 
   // --- category_id enrichment ---
   const categoryIndex = new Map();
@@ -105,7 +122,7 @@ export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, cou
 
   const payload = {
     purchase_plan: {
-      venue: { id: resolvedVenueId, currency, country: (venue.country || country).toUpperCase() },
+      venue: { id: resolvedVenueId, currency, country: venueCountry.toUpperCase() },
       delivery_method: "homedelivery",
       menu_items: menuItems,
       use_promo_discount_ids: promoCode ? [promoCode] : [],

@@ -14,7 +14,7 @@
   "bugs": { "url": "https://github.com/erlaufer/wolt-mcp/issues" },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node ../test/recipe.test.mjs && node ../test/basket.test.mjs && node ../test/http.test.mjs && node ../test/version.test.mjs"
+    "test": "node ../test/recipe.test.mjs && node ../test/basket.test.mjs && node ../test/http.test.mjs && node ../test/lang.test.mjs && node ../test/plan.test.mjs && node ../test/version.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",

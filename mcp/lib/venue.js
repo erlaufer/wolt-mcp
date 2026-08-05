@@ -42,7 +42,7 @@ export async function getVenue(slug) {
   const cached = cacheGet(slug);
   // Entries cached before shareUrl existed lack the field — refetch those.
   if (cached && "shareUrl" in cached) return cached;
-  const r = await woltFetch(`${VENUE_STATIC_BASE}${slug}/static`);
+  const r = await woltFetch(`${VENUE_STATIC_BASE}${slug}/static`, { auth: false });
   if (!r.ok) throw new Error(`venue fetch failed for "${slug}": HTTP ${r.status}`);
   const v = r.json?.venue || {};
   const venue = {
@@ -68,9 +68,49 @@ export async function getVenue(slug) {
 }
 
 async function getAssortment(slug) {
-  const r = await woltFetch(`${ASSORTMENT_BASE}${slug}/assortment`);
+  const r = await woltFetch(`${ASSORTMENT_BASE}${slug}/assortment`, { auth: false });
   if (!r.ok) throw new Error(`menu fetch failed for "${slug}": HTTP ${r.status}`);
+  // Any assortment fetch warms the catalog-language cache for free.
+  if (r.json?.primary_language) cachePut(`lang:${slug}`, { language: r.json.primary_language });
   return r.json || {};
+}
+
+// The language a venue's catalog is indexed in — Wolt reports it as
+// primary_language on the assortment (live-verified; available_languages marks
+// every other language as autotranslated). Cached 24h alongside venue details.
+// Null when unknown; never throws, so callers can treat it as best-effort
+// metadata.
+export async function getCatalogLanguage(slug) {
+  const cached = cacheGet(`lang:${slug}`);
+  if (cached) return cached.language || null;
+  try { return (await getAssortment(slug)).primary_language || null; } catch (e) { return null; }
+}
+
+// The catalog language of the MARKET around a location — resolved from the
+// first grocery venue on the front feed (grocery catalogs are what plan_cart
+// races; a restaurant's language could differ). This is what lets the model
+// translate its list BEFORE the first plan_cart instead of learning the
+// language from a wasted planning round. Cached in ~11km buckets: market
+// language doesn't vary finer than that. Never throws; null on any failure.
+export async function getMarketLanguage({ lat, lon }) {
+  const key = `marketlang:${lat.toFixed(1)},${lon.toFixed(1)}`;
+  const cached = cacheGet(key);
+  if (cached) return cached.language || null;
+  try {
+    const r = await woltFetch(`https://consumer-api.wolt.com/v1/pages/front?lat=${lat}&lon=${lon}`, { auth: false });
+    if (!r.ok) return null;
+    let slug = null;
+    for (const s of r.json?.sections || []) {
+      for (const it of s.items || []) {
+        if (it.venue?.slug && it.venue.product_line !== "restaurant") { slug = it.venue.slug; break; }
+      }
+      if (slug) break;
+    }
+    if (!slug) return null;
+    const language = await getCatalogLanguage(slug);
+    if (language) cachePut(key, { language, slug });
+    return language;
+  } catch (e) { return null; }
 }
 
 // Parse a Wolt item URL: .../venue/<slug>/itemid-<id>, menuitem-<id>, or
@@ -126,14 +166,35 @@ export async function resolveItem(slug, ref) {
 
 function normalizeMenuItem(it) {
   const groups = it.options || [];
+  const w = it.sell_by_weight_config;
   return {
     itemId: it.id,
     name: it.name,
     price: it.price ?? null,
     description: it.description || null,
     optionGroups: groups.length,
-    requiredOptions: groups.some((g) => (g.multi_choice_config?.total_range?.min ?? 0) > 0)
+    requiredOptions: groups.some((g) => (g.multi_choice_config?.total_range?.min ?? 0) > 0),
+    // Weighted items: valid weights are MULTIPLES of gramsPerStep (min one
+    // step) — off-step weights are silently dropped by the basket write.
+    ...(w ? { isWeighted: true, sellByWeight: { gramsPerStep: w.grams_per_step ?? null, pricePerKg: w.price_per_kg ?? null } } : {})
   };
+}
+
+// How each item in a batch is sold, keyed by item id: { gramsPerStep: N } for
+// weighted items, { gramsPerStep: null } for count items. An id ABSENT from
+// the map is unknown (item not returned by the catalog — maybe delisted), and
+// null means the whole lookup failed; reconciliation must touch neither.
+export async function getWeightConfigs(slug, itemIds) {
+  if (!itemIds.length) return new Map();
+  try {
+    const r = await woltFetch(`${ASSORTMENT_BASE}${slug}/assortment/items`, { method: "POST", body: { item_ids: itemIds }, auth: false });
+    if (!r.ok || !Array.isArray(r.json?.items)) return null;
+    const out = new Map();
+    for (const it of r.json.items) {
+      out.set(it.id, { gramsPerStep: it.sell_by_weight_config?.grams_per_step ?? null });
+    }
+    return out;
+  } catch (e) { return null; }
 }
 
 // Flatten the (possibly nested) category tree.
@@ -165,7 +226,7 @@ export async function getCategories(slug) {
 // Fetch one category's items (works for the leaf categories of a partial
 // assortment, where the top-level payload carries categories but no items).
 async function fetchCategoryItems(slug, categorySlug) {
-  const r = await woltFetch(`${ASSORTMENT_BASE}${slug}/assortment/categories/slug/${encodeURIComponent(categorySlug)}`);
+  const r = await woltFetch(`${ASSORTMENT_BASE}${slug}/assortment/categories/slug/${encodeURIComponent(categorySlug)}`, { auth: false });
   if (!r.ok) throw new Error(`category "${categorySlug}" fetch failed: HTTP ${r.status}`);
   return r.json || {};
 }
@@ -173,8 +234,12 @@ async function fetchCategoryItems(slug, categorySlug) {
 // In-venue item search (server-side; the only way to reach every item of a
 // large "partial" grocery assortment).
 async function searchAssortmentItems(slug, query, lang = "en") {
-  const r = await woltFetch(`${ASSORTMENT_BASE}${slug}/assortment/items/search`, { method: "POST", body: { q: query }, lang });
-  if (!r.ok) throw new Error(`in-venue search failed: HTTP ${r.status}`);
+  const r = await woltFetch(`${ASSORTMENT_BASE}${slug}/assortment/items/search`, { method: "POST", body: { q: query }, lang, auth: false });
+  if (!r.ok) {
+    const err = new Error(`in-venue search failed: HTTP ${r.status}`);
+    err.status = r.status; // lets plan-level accounting tell 429 from the rest
+    throw err;
+  }
   return r.json?.items || [];
 }
 
@@ -238,7 +303,7 @@ export async function getItemOptions(slug, itemId) {
   let item = (a.items || []).find((it) => it.id === itemId);
   if (!item && a.loading_strategy === "partial") {
     // partial catalogs carry no top-level items — fetch this one by id
-    const r = await woltFetch(`${ASSORTMENT_BASE}${slug}/assortment/items`, { method: "POST", body: { item_ids: [itemId] } });
+    const r = await woltFetch(`${ASSORTMENT_BASE}${slug}/assortment/items`, { method: "POST", body: { item_ids: [itemId] }, auth: false });
     item = r.ok ? (r.json?.items || [])[0] : null;
   }
   if (!item) throw new Error(`item ${itemId} not found in "${slug}" menu`);

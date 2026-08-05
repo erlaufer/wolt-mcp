@@ -1,0 +1,11 @@
+{
+  "name": "wolt-mcp-demo-src",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "render": "node render.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "1.62.0"
+  }
+}

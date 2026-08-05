@@ -6,6 +6,8 @@ Exposes Wolt as MCP tools, so you can tell Claude Desktop, Claude Code, Cursor, 
 
 Your client's own model does the reasoning — no hosted LLM, no API key here. Nothing is ever ordered: you review and check out on wolt.com.
 
+**Model requirements:** the client model carries all the judgment — translating your list into the store's catalog language, telling real products from lookalike junk matches, and reviewing the cart before writing it. Use a frontier-tier model (any current Sonnet/Opus-class model works well). Small "fast" models produced unreliable results in testing — including confidently reporting available products as unavailable — so reserve them for browsing, not cart building.
+
 ## Install
 
 ```sh
