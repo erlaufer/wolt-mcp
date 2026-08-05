@@ -3,6 +3,7 @@
 //
 //   node test/bench.mjs           # score, compare to test/benchmarks/baseline.json
 //   node test/bench.mjs --save    # score and adopt the result as the new baseline
+//   node test/bench.mjs --check   # exit non-zero if quality regressed (CI gate)
 //
 // Why a score and not a pass/fail: coverage is the number the tool reports,
 // and coverage lies. A run can fill 5 of 5 lines while putting sun-dried
@@ -155,4 +156,20 @@ if (process.argv.includes("--save")) {
   mkdirSync(dirname(BASELINE), { recursive: true });
   writeFileSync(BASELINE, JSON.stringify({ markets: results, overall }, null, 2) + "\n");
   console.log(`\n  saved baseline -> ${BASELINE}`);
+}
+
+// CI gate. Getting better is always allowed; getting worse has to be a
+// deliberate act of re-baselining, not something that slips through review.
+if (process.argv.includes("--check")) {
+  if (!base) { console.error("\n  no baseline to check against — run with --save first"); process.exit(1); }
+  const problems = [];
+  if (overall.score < base.overall.score) problems.push(`score ${overall.score} < baseline ${base.overall.score}`);
+  if (overall.traps > base.overall.traps) problems.push(`traps ${overall.traps} > baseline ${base.overall.traps}`);
+  if (overall.trapsFlagged < overall.traps) problems.push(`${overall.traps - overall.trapsFlagged} wrong pick(s) went unflagged`);
+  if (problems.length) {
+    console.error(`\n  REGRESSION: ${problems.join("; ")}`);
+    console.error("  If the change is intended, re-run with --save and commit the new baseline.");
+    process.exit(1);
+  }
+  console.log("  no regression against the baseline");
 }

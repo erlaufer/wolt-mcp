@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The package requires Node 22+; current LTS and the next line get run
+        # so a release can't depend on one machine's Node.
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: mcp/package-lock.json
+
+      - run: npm ci
+        working-directory: mcp
+
+      # Offline by construction: the planning tests replay recorded catalogs
+      # with global fetch disabled, so a red build means our logic changed —
+      # never that Wolt was slow or a shop restocked.
+      - name: unit + replay suite
+        run: npm test
+        working-directory: mcp
+
+      # Quality gate. Improvements pass; regressions have to be re-baselined
+      # deliberately rather than slipping through.
+      - name: match quality benchmark
+        run: node test/bench.mjs --check
