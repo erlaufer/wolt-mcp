@@ -89,6 +89,8 @@ a silent pricing bug, not a recoverable one.
 
 - `npm run bench` (`node test/bench.mjs`) — scores match quality against the same recorded catalogs and prints the delta against `test/benchmarks/baseline.json` (`--save` adopts a new baseline). It deliberately does not report coverage, which lies: a run can fill every line while putting tomato pesto where tomatoes belong. It counts **correct** lines and **traps** — lines filled with the wrong thing, which is worse than a missing line because the user is told it's handled. Ground truth is per-market accept/reject name patterns, and each market scores against a pinned store so a matching change is measured on a fixed catalog rather than on whichever shop won that minute's race.
 
+- `npm run timing` (`node mcp/test/timing.mjs`) — live latency of the main tools through a real MCP client, no login needed. Current shape: a 5-ingredient `plan_cart` is ~9 s, a 10-ingredient one ~20 s, because a plan costs roughly *stores raced × ingredients* in-venue searches and Wolt answers each in ~1–3 s. Our own rate limiter is a minor term — loosening it from 6 concurrent/80 ms to 12/30 ms moved a 10-line plan by about 12%.
+
 Release steps (version bump, `.mcpb` build, publish, post-publish verification) live in [releasing.md](releasing.md).
 
 ## Known limitations

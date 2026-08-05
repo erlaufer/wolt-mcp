@@ -15,7 +15,8 @@
   "scripts": {
     "start": "node server.mjs",
     "test": "node ../test/recipe.test.mjs && node ../test/basket.test.mjs && node ../test/http.test.mjs && node ../test/lang.test.mjs && node ../test/match.test.mjs && node ../test/plan.test.mjs && node ../test/replay.test.mjs && node ../test/version.test.mjs",
-    "bench": "node ../test/bench.mjs"
+    "bench": "node ../test/bench.mjs",
+    "timing": "node test/timing.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
