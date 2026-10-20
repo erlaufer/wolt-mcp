@@ -9,7 +9,12 @@
 // Auth: search needs none. Account and basket calls need a token — connect once
 // via login_via_chrome (or set_wolt_token); it auto-renews after that.
 // See docs/architecture.md for how the API layer works.
+//
+// Transports: stdio by default (what every desktop MCP client speaks), or
+// `--http` for a remote Streamable HTTP server behind OAuth — see docs/remote.md.
 import { createRequire } from "node:module";
+import { realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -21,7 +26,8 @@ import {
 import { woltFetch } from "./lib/http.js";
 import { rankCandidates } from "./lib/match.js";
 import { parseIngredientLine } from "./lib/recipe.js";
-import { setTokens, describeTokens, getAccessToken } from "./lib/auth.js";
+import { setTokens, describeTokens, getAccessToken, exportRefreshToken, isRemoteMode } from "./lib/auth.js";
+import { serveHttp, parseHttpArgs } from "./lib/remote.js";
 import { getLocation, setLocation, estimateLocation } from "./lib/config.js";
 import { checkoutPreview } from "./lib/checkout.js";
 import { cdpLogin } from "./lib/cdp-login.js";
@@ -29,6 +35,7 @@ import { getVenue, getMenu, getItemOptions, getCategories, resolveItem, parseIte
 import { getOrderHistory, getOrder, geocodeAddress } from "./lib/account.js";
 import { langOf, sameScript, isNonLatinLang } from "./lib/lang.js";
 import { planAtVenue, planResponse, translationPreflight, rankPlans, mapPool } from "./lib/plan.js";
+import { rich, uiMeta, resultMeta, describe, registerUi, imageUrlOf, woltImageUrl, woltLinkUrl } from "./lib/ui.js";
 
 // catalogLanguage (+ a hint for non-Latin markets) for tool responses that
 // establish or report the user's location — so the model knows to translate
@@ -50,7 +57,9 @@ async function marketLanguageFields(lat, lon) {
 // when nothing is available so the model asks the user instead of guessing.
 async function needLocation(lat, lon) {
   if (lat != null && lon != null) return { lat, lon };
-  const loc = getLocation() || await estimateLocation();
+  // A server's public IP says where the server is, not the user — remotely
+  // the model has to ask (or pull the saved Wolt address) instead.
+  const loc = getLocation() || (isRemoteMode() ? null : await estimateLocation());
   if (!loc) throw new Error("No delivery location is set and IP detection failed. Ask the user for their address and call set_location, or call use_saved_address to use their saved Wolt addresses.");
   return { lat: lat ?? loc.lat, lon: lon ?? loc.lon };
 }
@@ -61,9 +70,16 @@ async function getBasketsPage(lat, lon) {
   return r.json;
 }
 
+// Only the process started with this file as its entry point acts on argv and
+// opens a transport. Importers (the tests, a custom host) get buildServer and
+// nothing else happens. realpath: `npx wolt-mcp` runs through a bin symlink.
+const isMain = (() => {
+  try { return process.argv[1] && pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url; } catch (e) { return false; }
+})();
+
 // `npx -y wolt-mcp install` — one-liner setup: registers this server in Claude
 // Desktop's config (and prints the JSON for any other MCP client), then exits.
-if (process.argv[2] === "install") {
+if (isMain && process.argv[2] === "install") {
   const { readFileSync, writeFileSync, mkdirSync, existsSync } = await import("node:fs");
   const { homedir } = await import("node:os");
   const { join } = await import("node:path");
@@ -135,12 +151,93 @@ const errText = (msg) => ({ content: [{ type: "text", text: msg }], isError: tru
 // Version comes from package.json so a release bump can't leave the server
 // reporting a stale one (test/version.test.mjs keeps manifest.json in step).
 const { version: VERSION } = createRequire(import.meta.url)("./package.json");
-const server = new McpServer({ name: "wolt-mcp", version: VERSION }, {
-  instructions: "When the user wants to BUY something (not just browse), call wolt_status FIRST — it live-verifies the Wolt login. If it reports loginNeeded, sort the login out with the user (login_via_chrome, or set_wolt_token on Firefox/Safari) before searching and planning, so the work isn't lost to an expired session mid-checkout. Searching and browsing venues never need a login. For the delivery address: use_saved_address pulls the user's saved Wolt addresses and sets one as the search location (get_wolt_profile does NOT have addresses); a spoken address goes through resolve_address + set_location. Baskets are single-venue: source every item from one store. The fast path for a shopping list is wolt_status -> use_saved_address (if no location) -> ONE plan_cart call (it auto-picks the store and reports runner-up coverage) -> review the matches -> add_to_cart -> checkout_preview. wolt_status and the address tools report the market's catalogLanguage — translate the ingredient list into it BEFORE calling plan_cart (Greek in Greece, Japanese in Japan, Hebrew in Israel, Georgian in Georgia, and so on), and write each product in dictionary form (singular nominative, like a shelf label) since catalog search matches prefixes and inflected words find little or nothing; plan_cart refuses off-language lists with needsTranslation. Don't compare stores manually with repeated searches unless the user asks, and never write a lowCoverage plan without agreeing with the user first."
-});
+export { VERSION };
+
+// `npx -y wolt-mcp login` — harvest a Wolt refresh token on THIS machine (the
+// browser login can't run on a remote server) and print it for set_wolt_token
+// on the remote. The tokens also land in the local store as usual.
+if (isMain && process.argv[2] === "login") {
+  try {
+    const { tokenState } = await cdpLogin({});
+    const refresh = exportRefreshToken();
+    console.log(`Connected. Tokens stored in ${tokenState.stateFile}.`);
+    if (refresh) console.log(`\nRefresh token for a remote wolt-mcp (paste it via set_wolt_token, or copy tokens.json to the server's state dir):\n\n${refresh}\n`);
+    process.exit(0);
+  } catch (e) {
+    console.error(`Login failed: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+// Tools are collected in a registry and applied by buildServer(), because the
+// HTTP transport is stateless and builds a fresh McpServer per request, while
+// stdio builds exactly one. Registering 29 tools costs about a millisecond.
+//
+// Annotations are what a client shows before a call: ChatGPT treats every
+// tool WITHOUT readOnlyHint as a write and asks for confirmation each time,
+// so the hints are kept here in one table and a test checks it is complete.
+// openWorldHint is true throughout — every tool talks to wolt.com.
+const READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true };
+const WRITE = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
+const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true };
+export const TOOL_ANNOTATIONS = {
+  search_products: READ, search_restaurant_dishes: READ, plan_cart: READ, get_baskets: READ,
+  get_venue: READ, get_venue_menu: READ, get_venue_categories: READ, find_item: READ, get_dish_options: READ,
+  get_order_history: READ, get_order: READ, resolve_address: READ, get_feed: READ, top_venues: READ,
+  search_venues: READ, get_payment_methods: READ, get_favorites: READ, checkout_preview: READ,
+  get_wolt_profile: READ, wolt_status: READ, show_picks: READ,
+  // These change the basket, the account, or this server's own saved state.
+  use_saved_address: WRITE, add_to_cart: WRITE, update_cart_item: WRITE, add_favorite: WRITE,
+  remove_favorite: WRITE, login_via_chrome: WRITE, set_wolt_token: WRITE, set_location: WRITE,
+  clear_basket: DESTRUCTIVE
+};
+// Tools that only make sense on the user's own machine. A remote server has no
+// browser to drive; its users connect with `npx -y wolt-mcp login` locally.
+const LOCAL_ONLY_TOOLS = new Set(["login_via_chrome"]);
+
+const registry = [];
+// tool(name, description, [schema], handler, [extra]) — the shape the
+// registrations below have always used; the schema is optional for
+// argument-less tools, and extra carries outputSchema / _meta when a tool
+// has them.
+function tool(name, description, schemaOrHandler, maybeHandler, maybeExtra) {
+  const hasSchema = typeof schemaOrHandler !== "function";
+  const handler = hasSchema ? maybeHandler : schemaOrHandler;
+  const schema = hasSchema ? schemaOrHandler : undefined;
+  const extra = (hasSchema ? maybeExtra : maybeHandler) || {};
+  const annotations = TOOL_ANNOTATIONS[name];
+  if (!annotations) throw new Error(`tool ${name} has no entry in TOOL_ANNOTATIONS`);
+  registry.push({ name, description, schema, annotations, handler, ...extra });
+}
+
+const INSTRUCTIONS = (remote) => "When the user wants to BUY something (not just browse), call wolt_status FIRST — it live-verifies the Wolt login. If it reports loginNeeded, sort the login out with the user (" +
+  (remote
+    ? "this server runs remotely, so there is no browser login here: the user logs in at wolt.com, opens developer tools → Network, finds the request to authentication.wolt.com/v1/wauth2/access_token, copies its refresh_token, and pastes it to set_wolt_token"
+    : "login_via_chrome, or set_wolt_token on Firefox/Safari") +
+  ") before searching and planning, so the work isn't lost to an expired session mid-checkout. Searching and browsing venues never need a login.";
+
+export function buildServer({ remote = false } = {}) {
+  const server = new McpServer({ name: "wolt-mcp", version: VERSION }, {
+    instructions: INSTRUCTIONS(remote) + " For the delivery address: use_saved_address pulls the user's saved Wolt addresses and sets one as the search location (get_wolt_profile does NOT have addresses); a spoken address goes through resolve_address + set_location. Baskets are single-venue: source every item from one store. The fast path for a shopping list is wolt_status -> use_saved_address (if no location) -> ONE plan_cart call (it auto-picks the store and reports runner-up coverage) -> review the matches -> add_to_cart -> checkout_preview. wolt_status and the address tools report the market's catalogLanguage — translate the ingredient list into it BEFORE calling plan_cart (Greek in Greece, Japanese in Japan, Hebrew in Israel, Georgian in Georgia, and so on), and write each product in dictionary form (singular nominative, like a shelf label) since catalog search matches prefixes and inflected words find little or nothing; plan_cart refuses off-language lists with needsTranslation. Don't compare stores manually with repeated searches unless the user asks, and never write a lowCoverage plan without agreeing with the user first. Pictures: items and venues come with imageUrl, Wolt's own photo on a public CDN — show those when you illustrate results, never stock or web-search images, and if you can't embed them, link them. Whenever you present a shortlist — dinner ideas, the best venues nearby, product options — research with the search/feed/menu tools (they return text) and then call show_picks ONCE with the final picks (names, prices, imageUrl, rating, venue) so they appear as one set of photo cards; keep the prose short since the cards carry the details. Only show_picks and checkout_preview draw a card; get_baskets is a plain lookup, so for \"add X\" or \"clear my basket\" do the write and report it in a sentence rather than listing every basket."
+  });
+  for (const t of registry) {
+    if (remote && LOCAL_ONLY_TOOLS.has(t.name)) continue;
+    const meta = { ...(uiMeta(t.name) || {}), ...(t._meta || {}) };
+    const stamp = resultMeta(t.name);
+    // A render tool's result carries the card metadata too (see resultMeta).
+    const handler = stamp ? async (...args) => {
+      const r = await t.handler(...args);
+      return r && r.structuredContent && !r.isError ? { ...r, _meta: { ...stamp, ...(r._meta || {}) } } : r;
+    } : t.handler;
+    server.registerTool(t.name, { description: describe(t.name, t.description), inputSchema: t.schema, outputSchema: t.outputSchema, annotations: t.annotations, _meta: Object.keys(meta).length ? meta : undefined }, handler);
+  }
+  // The inline-card template for hosts that render MCP Apps (lib/ui.js).
+  registerUi(server);
+  return server;
+}
 
 // --- search_products: one ingredient -> candidate products (no auth) ---
-server.tool(
+tool(
   "search_products",
   "Search Wolt grocery products for a single ingredient. Default: searches ALL nearby stores. With venue_slug: searches ONE store's own catalog (needs login; query in the store's language) — use this to check or fix a single item at the store you're building the basket at. For a whole recipe or shopping list, prefer plan_cart — it resolves every ingredient in one call. A basket must be all from ONE venueId. MATCHING RULES when picking: (1) Match the ingredient ITSELF — never a plant-based, vegan, imitation, or flavored substitute unless the user explicitly asked. e.g. 'Redefine Meat'/'plant-based mince' is NOT ground beef; margarine is NOT butter; imitation crab is NOT crab. (2) Do NOT just pick the cheapest — Wolt surfaces cheap 'Substitute Deals' that are often imitation products; prefer the real, mainstream item at a sensible package size. (3) Match the right FORM (crushed tomatoes ≠ tomato paste; ground beef ≠ beef sausage). When unsure, prefer the plainest real version of the actual ingredient.",
   {
@@ -157,10 +254,10 @@ server.tool(
           getCatalogLanguage(venue_slug),
           searchVenueItems(venue_slug, query, { lang: langOf(query) })
         ]);
-        return text({
-          query, venue: { venueId: venue.venueId, slug: venue_slug, name: venue.name, currency: venue.currency, catalogLanguage },
+        return rich("products", {
+          query, venue: { venueId: venue.venueId, slug: venue_slug, name: venue.name, currency: venue.currency, catalogLanguage, imageUrl: venue.imageUrl ?? null },
           count: hits.length,
-          items: hits.slice(0, 15).map((c) => ({ itemId: c.itemId, name: c.name, price: c.price, ...(c.isWeighted ? { isWeighted: true, sellByWeight: c.sellByWeight } : {}) })),
+          items: hits.slice(0, 15).map((c) => ({ itemId: c.itemId, name: c.name, price: c.price, imageUrl: c.imageUrl ?? null, ...(c.isWeighted ? { isWeighted: true, sellByWeight: c.sellByWeight } : {}) })),
           ...(catalogLanguage && isNonLatinLang(catalogLanguage) && !sameScript(query, catalogLanguage)
             ? { languageNote: `This catalog is indexed in '${catalogLanguage}' and the query isn't — results may be poor or wrong-form. Translate the query to ${catalogLanguage} and retry for better matches.` }
             : {})
@@ -178,13 +275,13 @@ server.tool(
       // roughly half the payload.
       const venues = {};
       const top = items.slice(0, 20).map((c) => {
-        venues[c.venueId] ||= { name: c.venueName, slug: c.venueSlug, rating: c.venueRating, citySlug: c.citySlug, country: c.country };
+        venues[c.venueId] ||= { name: c.venueName, slug: c.venueSlug, rating: c.venueRating, citySlug: c.citySlug, country: c.country, ...(c.venueImage ? { imageUrl: c.venueImage } : {}) };
         return {
           itemId: c.itemId, name: c.name, price: c.price, currency: c.currency,
-          venueId: c.venueId, isWeighted: c.isWeighted, unitSize: c.unitSizeText
+          venueId: c.venueId, isWeighted: c.isWeighted, unitSize: c.unitSizeText, imageUrl: c.image || null
         };
       });
-      return text({ query, count: top.length, items: top, venues });
+      return rich("products", { query, count: top.length, items: top, venues });
     } catch (e) {
       return errText(`search failed: ${e.message}`);
     }
@@ -192,7 +289,7 @@ server.tool(
 );
 
 // --- search_restaurant_dishes: restaurant food, separate from groceries ---
-server.tool(
+tool(
   "search_restaurant_dishes",
   "Search RESTAURANT dishes (prepared food) near a location — separate from search_products, which is groceries only. Returns dishes with itemId, price, venueId/venueName. A basket is per-venue: don't mix dishes with grocery items. For dishes that likely have choices (burgers, pizzas, combos), call get_dish_options first and pass the user's selections to add_to_cart.",
   {
@@ -206,10 +303,10 @@ server.tool(
       const items = await searchItems(query, { lat, lon, lang: langOf(query), mode: "restaurant" });
       const venues = {};
       const top = items.slice(0, 20).map((c) => {
-        venues[c.venueId] ||= { name: c.venueName, slug: c.venueSlug, rating: c.venueRating, citySlug: c.citySlug, country: c.country };
-        return { itemId: c.itemId, name: c.name, price: c.price, currency: c.currency, venueId: c.venueId };
+        venues[c.venueId] ||= { name: c.venueName, slug: c.venueSlug, rating: c.venueRating, citySlug: c.citySlug, country: c.country, ...(c.venueImage ? { imageUrl: c.venueImage } : {}) };
+        return { itemId: c.itemId, name: c.name, price: c.price, currency: c.currency, venueId: c.venueId, imageUrl: c.image || null };
       });
-      return text({ query, count: top.length, dishes: top, venues });
+      return rich("dishes", { query, count: top.length, dishes: top, venues });
     } catch (e) {
       return errText(`restaurant search failed: ${e.message}`);
     }
@@ -217,7 +314,7 @@ server.tool(
 );
 
 // --- use_saved_address: pull the delivery address from the Wolt account ---
-server.tool(
+tool(
   "use_saved_address",
   "Fetch the user's saved Wolt delivery addresses (needs a token) and set one as the default search location. With no address_id: lists all addresses and auto-saves the one Wolt marks selected (or the only one). Call this right after connecting the account so searches use the user's real address instead of the default.",
   { address_id: z.string().optional().describe("Address id from a previous call, to pick a specific one") },
@@ -256,7 +353,7 @@ server.tool(
 );
 
 // --- plan_cart: whole list -> single-store plan, one call ---
-server.tool(
+tool(
   "plan_cart",
   "Resolve a whole ingredient list into a single-store cart in ONE call. Without venue_slug it auto-picks: shortlists the best-covering nearby stores and races the list against each store's own catalog, returning the winner plus per-store coverage of the runners-up (evaluatedVenues) — if lowCoverage is flagged, agree with the user before writing anything. With venue_slug it plans against that store only. Write ingredient lines in the market's catalog language (reported by wolt_status/set_location/use_saved_address as catalogLanguage — translate them yourself), and name each product in DICTIONARY form — singular nominative, the way a shelf label reads — because catalog search matches prefixes: an inflected line like '2 sipulia' finds a fraction of what '2 sipuli' finds, and in the worst case nothing. If most lines are in the wrong script it returns needsTranslation instead of planning — translate and call again. A rateLimited response means Wolt throttled the burst: wait ~30s and retry, don't rephrase. Returns line items with alternatives + a ready add_to_cart basket. Each line carries a confidence: 'low' ones are listed again under verifyBeforeWriting with the reason — read those names yourself and judge by meaning (a sauce, pesto, snack or flavoured version scores just as well as the real product), swapping in an alternative or dropping the line before you write anything.",
   {
@@ -271,7 +368,7 @@ server.tool(
         // Preflight: refuse to burn a whole planning round on off-script lines.
         const early = translationPreflight(ingredients, await getCatalogLanguage(venue_slug));
         if (early) return text(early);
-        return text(planResponse(await planAtVenue(venue_slug, ingredients), ingredients.length));
+        return rich("plan", planResponse(await planAtVenue(venue_slug, ingredients), ingredients.length));
       }
       ({ lat, lon } = await needLocation(lat, lon));
       const early = translationPreflight(ingredients, await getMarketLanguage({ lat, lon }));
@@ -297,7 +394,7 @@ server.tool(
           if (allDegraded) {
             return text({ rateLimited: true, note: "Wolt rate-limited the planning burst. Wait ~30 seconds and call plan_cart again, or pin one store with venue_slug." });
           }
-          return text({
+          return rich("plan", {
             ...planResponse(best, ingredients.length),
             evaluatedVenues: plans.map((p) => ({
               name: p.venue.name, slug: p.venue.slug, coverage: `${p.coverageCount}/${ingredients.length}`,
@@ -309,10 +406,10 @@ server.tool(
       const { venue, chosen, missing } = selectBestVenue(perIngredient);
       if (!venue) return text({ venue: null, missing, note: "No store covered these ingredients." });
       const currency = resolveCurrency({ candidates: chosen.map((c) => c.candidate), country: venue.country });
-      return text({
+      return rich("plan", {
         venue,
         coverage: `${chosen.length}/${ingredients.length}`,
-        lineItems: chosen.map((c) => ({ ingredient: c.ingredient, name: c.candidate.name, itemId: c.candidate.itemId, price: c.candidate.price, isWeighted: c.candidate.isWeighted })),
+        lineItems: chosen.map((c) => ({ ingredient: c.ingredient, name: c.candidate.name, itemId: c.candidate.itemId, price: c.candidate.price, isWeighted: c.candidate.isWeighted, imageUrl: c.candidate.image || null })),
         missing,
         basket: currency ? buildBasketBody(chosen.map((c) => ({ candidate: c.candidate, count: 1 })), venue.venueId, currency) : null,
         ...(currency ? {} : { basketNote: "No currency on record for this venue — call add_to_cart with an explicit currency taken from search_products results." })
@@ -324,7 +421,7 @@ server.tool(
 );
 
 // --- add_to_cart: write the basket (needs WOLT_BEARER_TOKEN) ---
-server.tool(
+tool(
   "add_to_cart",
   "Write items to the user's Wolt basket for one venue. All items must share the venue_id. Needs login (if wolt_status says loginNeeded, do that first). ALWAYS pass venue_slug: it lets each line's weighted flag be reconciled against how the catalog actually sells the item — items named '~900 g pack' are often COUNT items, truly weighted items only accept multiples of their gramsPerStep, and either mismatch is silently dropped by Wolt. Corrections made are reported as `adjustments`. The response also re-reads the basket and reports droppedLines for anything Wolt still discarded — treat those as NOT added. Returns a checkoutUrl — give it to the user, and call checkout_preview for the real total including fees. Nothing is ever ordered automatically; the user reviews and pays on wolt.com.",
   {
@@ -437,7 +534,7 @@ server.tool(
 );
 
 // --- get_baskets: list the user's current Wolt baskets ---
-server.tool(
+tool(
   "get_baskets",
   "List the user's current Wolt baskets (needs a token): basket id, venue, and line items with names, counts, and prices (minor units). Use before add_to_cart to see what's already there, or after to confirm the write persisted.",
   {
@@ -452,9 +549,10 @@ server.tool(
         basketId: b.id,
         venueId: b.venue?.id,
         venueName: b.venue?.name,
-        items: (b.items || []).map((it) => ({ id: it.id, name: it.name, count: it.count, price: it.price }))
+        currency: b.currency || null,
+        items: (b.items || []).map((it) => ({ id: it.id, name: it.name, count: it.count, price: it.price, imageUrl: imageUrlOf(it.image) || it.image_url || null }))
       }));
-      return text({ count: baskets.length, baskets });
+      return rich("baskets", { count: baskets.length, baskets });
     } catch (e) {
       return errText(e.message);
     }
@@ -462,7 +560,7 @@ server.tool(
 );
 
 // --- clear_basket: delete a basket by id ---
-server.tool(
+tool(
   "clear_basket",
   "Delete one of the user's Wolt baskets entirely (needs a token). Get the basketId from get_baskets. Confirm with the user before clearing a basket they built themselves.",
   { basket_id: z.string().describe("Basket id from get_baskets") },
@@ -478,20 +576,20 @@ server.tool(
 );
 
 // --- get_venue: detail + hours (slug-cached 24h) ---
-server.tool(
+tool(
   "get_venue",
   "Venue details by slug (from search results): rating, address, currency, delivery price, opening hours per day with timezone, and catalogLanguage (the language the venue's catalog is indexed in — query/plan in it for best matches). Check hours before adding food from a restaurant that might be closed.",
   { venue_slug: z.string() },
   async ({ venue_slug }) => {
     try {
       const [venue, catalogLanguage] = await Promise.all([getVenue(venue_slug), getCatalogLanguage(venue_slug)]);
-      return text({ ...venue, catalogLanguage });
+      return rich("venue", { ...venue, catalogLanguage });
     } catch (e) { return errText(e.message); }
   }
 );
 
 // --- get_venue_menu: browse/search within one venue ---
-server.tool(
+tool(
   "get_venue_menu",
   "Browse a venue's full menu by slug: categories and items with prices. Optional query (free-text filter) and category (slug). Items flag requiredOptions=true when the dish needs choices — fetch those with get_dish_options before add_to_cart.",
   {
@@ -501,12 +599,17 @@ server.tool(
     limit: z.number().int().default(30)
   },
   async ({ venue_slug, query, category, limit }) => {
-    try { return text(await getMenu(venue_slug, { query, categorySlug: category, limit })); } catch (e) { return errText(e.message); }
+    try {
+      // The venue (cached) supplies the currency the prices are in; the menu
+      // alone doesn't say, and a card would otherwise guess.
+      const [menu, venue] = await Promise.all([getMenu(venue_slug, { query, categorySlug: category, limit }), getVenue(venue_slug).catch(() => null)]);
+      return rich("menu", { venueSlug: venue_slug, currency: venue?.currency ?? null, ...menu });
+    } catch (e) { return errText(e.message); }
   }
 );
 
 // --- get_venue_categories: the browse index (big groceries nest deeply) ---
-server.tool(
+tool(
   "get_venue_categories",
   "List a venue's categories (nested: depth, parent, subcategories, item counts). Start here to browse a large grocery store, then call get_venue_menu with a category slug. Restaurants usually have a handful of flat categories.",
   { venue_slug: z.string() },
@@ -516,7 +619,7 @@ server.tool(
 );
 
 // --- find_item: resolve an item by name or wolt.com URL ---
-server.tool(
+tool(
   "find_item",
   "Resolve one item in a venue by name, item id, or a wolt.com item URL (…/venue/<slug>/itemid-<id>). Exact name matches win; an ambiguous name returns the top candidates so you can ask the user which they meant. Use when the user pastes a Wolt link or names a dish loosely.",
   {
@@ -533,7 +636,7 @@ server.tool(
 );
 
 // --- get_dish_options: option groups for one item ---
-server.tool(
+tool(
   "get_dish_options",
   "Option groups for one menu item (sizes, toppings, sides): group ids, required/min/max, and each value's id/name/price. Ask the user for required choices, then pass options to add_to_cart as [{id: groupId, values: [{id: valueId, count: 1, price}]}].",
   { venue_slug: z.string(), item_id: z.string().describe("itemId from get_venue_menu — availability varies by hour, so fetch the menu first") },
@@ -543,7 +646,7 @@ server.tool(
 );
 
 // --- get_order_history / get_order: enables "reorder my usual" ---
-server.tool(
+tool(
   "get_order_history",
   "The user's past Wolt orders (needs a token): venue, date, total, status, purchase_id. Use get_order for line items — together these enable 'order my usual again'.",
   { limit: z.number().int().default(10), skip: z.number().int().default(0) },
@@ -559,7 +662,7 @@ server.tool(
   }
 );
 
-server.tool(
+tool(
   "get_order",
   "Full detail for one past order by purchase_id (from get_order_history), including line items — feed them back into add_to_cart to reorder.",
   { purchase_id: z.string() },
@@ -569,7 +672,7 @@ server.tool(
 );
 
 // --- resolve_address: free-form address -> coordinates (OpenStreetMap) ---
-server.tool(
+tool(
   "resolve_address",
   "Geocode a free-form address to coordinates via OpenStreetMap (no Wolt account needed). Use the result with set_location. Returns up to 3 candidates — confirm with the user if ambiguous.",
   { address: z.string().describe("e.g. 'Aleksanterinkatu 1, Helsinki'") },
@@ -583,7 +686,7 @@ server.tool(
 );
 
 // --- get_feed: discovery front page ("Popular", "Order again", …) ---
-server.tool(
+tool(
   "get_feed",
   "Wolt's discovery feed near the user: sections like 'Order again', 'Popular right now' with venues (name, slug, rating, delivery estimate). Good for 'what should I eat?' questions.",
   {
@@ -593,25 +696,27 @@ server.tool(
   async ({ lat, lon, section }) => {
     try {
       ({ lat, lon } = await needLocation(lat, lon));
-      const r = await woltFetch(`https://consumer-api.wolt.com/v1/pages/front?lat=${lat}&lon=${lon}`);
+      const r = await woltFetch(`https://consumer-api.wolt.com/v1/pages/front?lat=${lat}&lon=${lon}`, { auth: "optional" });
       if (!r.ok) return errText(`feed failed: HTTP ${r.status}`);
       let sections = (r.json?.sections || []).map((s) => ({
         title: s.title || s.name || null,
         venues: (s.items || []).filter((it) => it.venue).slice(0, 10).map((it) => ({
           name: it.venue.name, slug: it.venue.slug, venueId: it.venue.id,
           rating: it.venue.rating?.score ?? it.venue.rating?.rating ?? null,
+          ratingVolume: it.venue.rating?.volume ?? null,
+          imageUrl: it.venue.image_url || imageUrlOf(it.image) || null,
           estimate: it.venue.estimate_range || it.venue.delivery_price || null,
           online: it.venue.online ?? null
         }))
       })).filter((s) => s.title && s.venues.length);
       if (section) sections = sections.filter((s) => s.title.toLowerCase().includes(section.toLowerCase()));
-      return text({ sections });
+      return rich("venues", { sections });
     } catch (e) { return errText(e.message); }
   }
 );
 
 // --- top_venues: ranked venues with real filters (open-now, fee, score) ---
-server.tool(
+tool(
   "top_venues",
   "Top venues near the user with real filters: open now, min score (0-10), max delivery fee, Wolt+ only, restaurant vs grocery, tag/name text. Sorted by score by default. THE tool for 'what's good and open near me right now?'.",
   {
@@ -628,7 +733,7 @@ server.tool(
   async ({ lat, lon, open_now, min_score, max_delivery_fee, wolt_plus_only, kind, query, sort, limit }) => {
     try {
       ({ lat, lon } = await needLocation(lat, lon));
-      const r = await woltFetch(`https://consumer-api.wolt.com/v1/pages/front?lat=${lat}&lon=${lon}`);
+      const r = await woltFetch(`https://consumer-api.wolt.com/v1/pages/front?lat=${lat}&lon=${lon}`, { auth: "optional" });
       if (!r.ok) return errText(`feed failed: HTTP ${r.status}`);
       const seen = new Set();
       let venues = [];
@@ -640,6 +745,7 @@ server.tool(
           venues.push({
             name: v.name, slug: v.slug, venueId: v.id,
             score: v.rating?.score ?? null, ratingVolume: v.rating?.volume ?? null,
+            imageUrl: v.image_url || imageUrlOf(it.image) || null, currency: v.currency || null,
             online: v.online ?? null, estimateMinutes: v.estimate ?? null,
             deliveryFee: v.delivery_price_int ?? null, deliveryFeeFormatted: v.delivery_price ?? null,
             woltPlus: !!v.show_wolt_plus, productLine: v.product_line || null,
@@ -662,13 +768,13 @@ server.tool(
         : sort === "estimate" ? (a.estimateMinutes ?? 1e9) - (b.estimateMinutes ?? 1e9)
         : (b.score ?? -1) - (a.score ?? -1)
       );
-      return text({ totalNearby: total, matching: venues.length, venues: venues.slice(0, limit) });
+      return rich("venues", { totalNearby: total, matching: venues.length, venues: venues.slice(0, limit) });
     } catch (e) { return errText(e.message); }
   }
 );
 
 // --- search_venues: find venues (not items) by name/cuisine ---
-server.tool(
+tool(
   "search_venues",
   "Search venues (stores AND restaurants) by name or cuisine near the user. Returns name, slug, venueId, rating, online status. Use get_venue for hours, get_venue_menu to browse.",
   { query: z.string(), lat: z.number().optional(), lon: z.number().optional() },
@@ -676,7 +782,7 @@ server.tool(
     try {
       ({ lat, lon } = await needLocation(lat, lon));
       const r = await woltFetch("https://restaurant-api.wolt.com/v1/pages/search", {
-        method: "POST", body: { q: query, target: null, lat, lon }
+        method: "POST", body: { q: query, target: null, lat, lon }, auth: "optional"
       });
       if (!r.ok) return errText(`venue search failed: HTTP ${r.status}`);
       const venues = [];
@@ -687,18 +793,20 @@ server.tool(
           venues.push({
             name: v.name, slug: v.slug, venueId: v.id,
             rating: v.rating?.score ?? v.rating?.rating ?? null,
+            ratingVolume: v.rating?.volume ?? null,
+            imageUrl: v.image_url || imageUrlOf(it.image) || null,
             online: v.online ?? null, address: v.address || null,
             productLine: v.product_line || null
           });
         }
       }
-      return text({ query, count: venues.length, venues: venues.slice(0, 15) });
+      return rich("venues", { query, count: venues.length, venues: venues.slice(0, 15) });
     } catch (e) { return errText(e.message); }
   }
 );
 
 // --- get_payment_methods (read-only) ---
-server.tool(
+tool(
   "get_payment_methods",
   "The user's saved Wolt payment methods (needs a token). Read-only — payment always happens on wolt.com.",
   async () => {
@@ -711,7 +819,7 @@ server.tool(
 );
 
 // --- favorites ---
-server.tool(
+tool(
   "get_favorites",
   "The user's favorited Wolt venues (needs a token).",
   async () => {
@@ -727,7 +835,7 @@ server.tool(
   }
 );
 
-server.tool(
+tool(
   "add_favorite",
   "Add a venue to the user's Wolt favorites (needs a token).",
   { venue_id: z.string().describe("Venue id (24 hex)") },
@@ -740,7 +848,7 @@ server.tool(
   }
 );
 
-server.tool(
+tool(
   "remove_favorite",
   "Remove a venue from the user's Wolt favorites (needs a token).",
   { venue_id: z.string().describe("Venue id (24 hex)") },
@@ -754,7 +862,7 @@ server.tool(
 );
 
 // --- checkout_preview: price the basket (fees, delivery) — never orders ---
-server.tool(
+tool(
   "checkout_preview",
   "Preview the checkout for the user's current basket at one venue: total payable amount including delivery fees and service charges, delivery options, and active offers. Read-only — never places an order. Use after add_to_cart to tell the user their real total before they open wolt.com.",
   {
@@ -772,15 +880,48 @@ server.tool(
         lat, lon, tip, promoCode: promo_code || null
       });
       const { raw, ...summary } = preview; // keep the tool result compact
-      return text(summary);
+      return rich("checkout", summary);
     } catch (e) {
       return errText(e.message);
     }
   }
 );
 
+// --- show_picks: the answer's own photo cards, one call per recommendation ---
+tool(
+  "show_picks",
+  "Present a curated shortlist (dishes, products or venues you are recommending) as ONE set of photo cards. Call it once, at the end, with the final picks — never per venue. Copy name, price (minor units) + currency, imageUrl, rating and venue from the results you got; imageUrl must be the Wolt photo from those results (other hosts are dropped) and url, if given, a wolt.com page. Does not touch Wolt. The cards offer Add and Open/Menu actions, so keep the prose around them short.",
+  {
+    title: z.string().max(120).optional().describe("Heading, e.g. 'Dinner tonight'"),
+    note: z.string().max(300).optional().describe("One line under the cards, e.g. 'Menu prices before fees'"),
+    items: z.array(z.object({
+      name: z.string().max(120),
+      description: z.string().max(200).optional(),
+      venueName: z.string().max(120).optional(),
+      venueSlug: z.string().max(120).optional(),
+      itemId: z.string().max(64).optional().describe("From the menu/search result, so the Add button can target it"),
+      price: z.number().int().nonnegative().optional().describe("Minor units, as returned by the tools"),
+      currency: z.string().length(3).optional(),
+      priceText: z.string().max(40).optional().describe("Instead of price+currency when only a formatted string is known"),
+      imageUrl: z.string().url().optional(),
+      rating: z.number().min(0).max(10).optional(),
+      eta: z.string().max(40).optional().describe("Delivery estimate as text, e.g. '30-40 min'"),
+      url: z.string().url().optional().describe("A wolt.com page for the pick (venue shareUrl)")
+    })).min(1).max(12)
+  },
+  async ({ title, note, items }) => {
+    const picks = items.map((p) => {
+      const out = { ...p };
+      if (p.imageUrl) { const u = woltImageUrl(p.imageUrl); if (u) out.imageUrl = u; else delete out.imageUrl; }
+      if (p.url) { const u = woltLinkUrl(p.url); if (u) out.url = u; else delete out.url; }
+      return out;
+    });
+    return rich("picks", { title: title ?? null, note: note ?? null, items: picks });
+  }
+);
+
 // --- update_cart_item: change a line's count or remove it ---
-server.tool(
+tool(
   "update_cart_item",
   "Set the count of one item in the user's basket at a venue, or remove it (count 0). Uses read-merge-write like add_to_cart. If removing the LAST line, the whole basket is deleted instead (Wolt has no empty-basket state).",
   {
@@ -824,7 +965,7 @@ server.tool(
 );
 
 // --- login_via_chrome: zero-paste login by watching a Chrome you launch ---
-server.tool(
+tool(
   "login_via_chrome",
   "Zero-paste Wolt login: launches a Chromium-based browser with wolt.com open; the user logs in normally and the refresh token is picked up automatically and exchanged for an API token. Tell the user two things: (1) a browser window will open in a SEPARATE, EMPTY profile, so they log into Wolt fresh there — their everyday profile, cookies and extensions are untouched; (2) this tool waits up to 2 minutes — if it times out the window stays open, so if they need longer (waiting on an emailed code), let them finish signing in there and call this again. Requires a Chromium-family browser — the user's default browser is auto-detected and used when it's Chrome, Edge, Brave, Vivaldi, Arc or Chromium (CDP-based, so Firefox and Safari cannot work; use set_wolt_token there instead). CHROME_BIN overrides the choice if needed. After a successful login, call use_saved_address so searches use the user's real address.",
   {},
@@ -839,7 +980,7 @@ server.tool(
 );
 
 // --- set_wolt_token: paste tokens in-chat; enables auto-refresh ---
-server.tool(
+tool(
   "set_wolt_token",
   "Store the user's Wolt tokens (persisted locally, chmod 600). Prefer login_via_chrome; use this when the user pastes a token themselves. Accepts access_token and/or refresh_token, or a JSON blob containing either. With a refresh token stored, the server auto-refreshes forever — the user pastes once.",
   {
@@ -860,23 +1001,64 @@ server.tool(
   }
 );
 
-// --- get_wolt_profile: authenticated user info (may include saved addresses) ---
-server.tool(
+// --- get_wolt_profile: who the connected Wolt account is ---
+//
+// Doubles as the connection's identity for clients that label linked
+// accounts: ChatGPT looks for a tool marked _meta["openai/profile"] and calls
+// it with the connection's credentials, expecting {id, name?, email?,
+// nickname?} and nothing else, with a stable id. So the shape is exactly that,
+// in structuredContent and as JSON text. A profile without an id is an error,
+// never a made-up one — an invented id would make ChatGPT merge or split
+// accounts wrongly.
+tool(
   "get_wolt_profile",
-  "Fetch the logged-in user's Wolt profile — name/email/phone only (GET /v1/user/me; needs a token). It does NOT contain delivery addresses: to pull the user's saved addresses and set one as the search location, call use_saved_address instead.",
+  "Who the connected Wolt account is: id, name and email (GET /v1/user/me; needs a token). It does NOT contain delivery addresses: to pull the user's saved addresses and set one as the search location, call use_saved_address instead.",
   async () => {
     try {
       const r = await woltFetch("https://restaurant-api.wolt.com/v1/user/me");
       if (!r.ok) return errText(`profile fetch failed: HTTP ${r.status} ${r.text.slice(0, 200)}`);
-      return text(r.json ?? r.text);
+      const profile = woltProfile(r.json);
+      if (!profile) return errText("Wolt returned a profile without a stable user id — nothing to report.");
+      return { content: [{ type: "text", text: JSON.stringify(profile) }], structuredContent: profile };
     } catch (e) {
       return errText(e.message);
     }
+  },
+  {
+    outputSchema: {
+      id: z.string().min(1).regex(/\S/).describe("Wolt user id — stable for the account"),
+      name: z.string().optional(),
+      email: z.string().optional(),
+      nickname: z.string().optional().describe("First name, to tell connected accounts apart")
+    },
+    _meta: { "openai/profile": true }
   }
 );
 
+// Wolt's /v1/user/me wraps the record in `user`, with a Mongo-style id
+// (`_id: {$oid}`, verified live) and the name as {first_name, last_name}.
+// Plain-string ids and names are accepted too in case another endpoint
+// version shows up. Only the identity fields are kept — see the tool's comment.
+export function woltProfile(json) {
+  const u = json?.user || json || {};
+  const rawId = u._id ?? u.id ?? u.user_id;
+  const id = typeof rawId === "object" && rawId ? rawId.$oid : rawId;
+  if (typeof id !== "string" || !id.trim()) return null;
+  const n = u.name;
+  const first = typeof n === "object" && n ? n.first_name : u.first_name;
+  const last = typeof n === "object" && n ? n.last_name : u.last_name;
+  const name = typeof n === "string" ? n : [first, last].filter(Boolean).join(" ");
+  const email = typeof u.email === "string" ? u.email : undefined;
+  return {
+    id,
+    ...(name ? { name } : {}),
+    ...(email ? { email } : {}),
+    ...(first ? { nickname: first } : {})
+  };
+}
+
 // --- set_location: persist the delivery location ---
-server.tool(
+tool(
   "set_location",
   "Save the user's delivery location (persisted; used as the default for all searches). When the user gives an address or city, geocode it with resolve_address first and pass the coordinates here with the human-readable text as label. For their saved Wolt addresses, use use_saved_address instead.",
   {
@@ -888,7 +1070,7 @@ server.tool(
 );
 
 // --- wolt_status: live login check + location ---
-server.tool(
+tool(
   "wolt_status",
   "Call this FIRST whenever the user wants to buy or manage their account: it live-verifies the Wolt login (refreshing the access token if needed) and reports the configured location plus the market's catalogLanguage — write product queries and plan_cart ingredient lines in that language (translate them yourself). If loginNeeded is true, offer login_via_chrome (or set_wolt_token) before planning a cart. Search works without a token.",
   async () => {
@@ -908,5 +1090,12 @@ server.tool(
   }
 );
 
-await server.connect(new StdioServerTransport());
-console.error("wolt-mcp server running on stdio");
+if (isMain) {
+  const http = parseHttpArgs(process.argv.slice(2), process.env);
+  if (http) {
+    await serveHttp({ buildServer, version: VERSION, ...http });
+  } else {
+    await buildServer().connect(new StdioServerTransport());
+    console.error("wolt-mcp server running on stdio");
+  }
+}

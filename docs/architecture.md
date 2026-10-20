@@ -16,7 +16,13 @@ mcp/lib/
   account.js       order history, geocoding
   cdp-login.js     zero-paste browser login over the DevTools Protocol
   config.js        saved location
+  remote.js        Streamable HTTP transport (stateless) and its routes
+  oauth.js         the OAuth 2.1 server in front of it, Cloudflare Access JWT check
+  context.js       per-request state directory (one Wolt account per OAuth grant)
+deploy/            Dockerfile, compose file with a Cloudflare Tunnel connector
 ```
+
+`server.mjs` collects the tools in a registry and `buildServer()` applies them: stdio builds one server for the life of the process, the HTTP transport builds one per request. Each tool carries annotations (`readOnlyHint` and friends) from a single table, and a test fails if a tool is missing from it.
 
 ## Requests
 
@@ -80,6 +86,28 @@ of them knows. Callers then refuse the write with a message asking for a
 currency. Nothing defaults to a particular market's money: a wrong currency is
 a silent pricing bug, not a recoverable one.
 
+## Remote transport
+
+`--http` serves the same tools over Streamable HTTP at `/mcp`, stateless: a fresh `McpServer` plus transport per request, torn down when the response closes. No session ids, so there is nothing to lose across restarts and `GET /mcp` is a 405. Only `login_via_chrome` is withheld — a server has no browser — and the token-setup message points at `npx -y wolt-mcp login` on the user's own machine instead.
+
+Auth is OAuth 2.1 served by `oauth.js`: protected-resource and authorization-server metadata, open dynamic client registration, PKCE-only authorization codes (in memory, ten minutes, single use), opaque bearer and rotating refresh tokens stored hashed in `oauth.json`. The human check sits on `/authorize` and is one of two guards: Cloudflare Access in front of that path (the server verifies the `Cf-Access-Jwt-Assertion` RS256 JWT against the team's JWKS — signature, issuer, audience, expiry) or a shared approve secret. Either way the user clicks Allow on a same-origin form; auto-approval would let any registered client lift a code from a logged-in browser. `WOLT_API_TOKENS` adds fixed bearer tokens for header-only clients.
+
+Every grant brings its own Wolt account; the server holds none to share. The refresh token pasted on the approve page is exchanged once, stored under `accounts/<id>/` in the state dir, and the id travels on the grant's tokens through every refresh. `context.js` holds the request's state directory in an `AsyncLocalStorage`; `auth.js` and `config.js` resolve their files through it instead of constants, so tokens and the saved location are per account without the tool code knowing. Remotely the IP-based location guess is off — it would point at the server. Details and deployment in [remote.md](remote.md).
+
+## Rich results
+
+Every item and venue carries an `imageUrl` (Wolt serves all images from `imageproxy.wolt.com` without auth; `?w=400` resizes) and venues carry `ratingScore` (out of 10) and `ratingVolume`. On top of that, `lib/ui.js` registers one HTML resource at `ui://wolt-mcp/cards.html` and marks the read-only "render" tools (search, menu, venues, plan, baskets, checkout) with `_meta.ui.resourceUri` — the MCP Apps extension that ChatGPT and Claude render as an inline iframe — plus ChatGPT's older `openai/outputTemplate` alias. Those tools return their JSON as text exactly as before and the same object as `structuredContent` with a `view` tag; `ui/cards.html` speaks the MCP Apps handshake (`ui/initialize`, `ui/notifications/tool-result`) and ChatGPT's `window.openai` globals, draws the view, and talks back only through follow-up messages (`ui/message`), so a card can ask for a menu or an add-to-cart without doing it behind the model's back. Hosts without MCP Apps ignore all of it.
+
+Feed and venue search are `auth: "optional"`: personalised when the account is connected, public otherwise, so they work before any login.
+
+The render tools' descriptions end with `IMAGE_HINT` (and the server instructions repeat it): the `imageUrl` values are Wolt's own photos and the model should show or link those rather than reach for an image search. That matters on hosts that don't draw the cards, where the model writes the whole answer and otherwise fills the picture slot with stock photos. ChatGPT's own message body never loads images from outside its storage (its `url_safe` filter strips them), so the iframe is the only place a Wolt photo shows up there.
+
+Which tools render is a deliberate short list (`RENDER_TOOLS`): the checkout preview and `show_picks`, the two results that end a turn. Everything the model calls on the way (the searches, the feed, venue ranking, venue detail, menus, the planned cart, the baskets it reads before adding or clearing) is text-only although it carries pictures. Three observations forced that: a recommendation calls those tools once per candidate, and a host that draws a frame per call turned one answer into a dozen frames; ChatGPT has been seen to hydrate only the last frame of a turn, leaving the earlier ones blank with no tool input or output at all; and a basket card on every basket lookup made "add X" and "clear my basket" answers open with every basket the account holds. So the answer's own cards come from `show_picks`, a tool that does not touch Wolt: the model hands it the final shortlist (name, price, `imageUrl`, rating, venue, optional item id and wolt.com link) and gets one `picks` card set back. Because those URLs come from the model, `woltImageUrl`/`woltLinkUrl` keep only Wolt's hosts; anything else is dropped before it reaches the iframe.
+
+The template looks up its root element and runs its first render only after every function it uses is defined. ChatGPT sets `window.openai.toolOutput` before the script runs, so that first render happens synchronously during setup; an earlier version rendered from inside the bridge, before `root` was assigned, and every ChatGPT card stayed on "Loading…". A render that throws now falls back to the raw data with the error on top, and a card that gets no data within a few seconds shows one line pointing at the reply and logs to the console which ChatGPT globals held anything.
+
+ChatGPT has not been consistent about where the data is. The template therefore looks in `toolOutput` bare, wrapped as `{result: {structuredContent}}`, and in `toolResponseMetadata` (the whole tool-result envelope), and as a last resort parses the text content block, which `rich()` tags with the same `view` for exactly that reason; it also polls those globals for half a minute, because the data has been seen to appear without a `set_globals` event. Render tool results additionally carry the card `_meta` themselves (`resultMeta`), as ChatGPT's own example servers do.
+
 ## Testing
 
 - `npm test` — offline unit tests (no network, no credentials), including a release guard that package.json, manifest.json and the lockfile carry the same version.
@@ -87,6 +115,8 @@ a silent pricing bug, not a recoverable one.
 - `node test/mcp.live.mjs` — lower-level live check of the lib layer directly (refresh → search → basket write → merge/persist verification → cleanup), bypassing the MCP protocol. Needs real credentials and writes a temporary basket to your account.
 - `node mcp/test/tools.live.mjs` — drives every tool through a real stdio MCP client against a live account. Cart tests use a temporary basket and clean up; favorites tests are self-reversing; `set_wolt_token` round-trips the tokens already on disk rather than writing a dummy. A coverage guard compares the tools actually called against `listTools()` and fails the run on any gap, so a newly added tool can't go untested. Only `login_via_chrome` is skipped, being interactive.
 
+- `node mcp/test/remote.test.mjs` (part of `npm test`) — the HTTP transport in-process on a loopback port: discovery, client registration, the approve page (wrong secret, cross-site post, the real thing), PKCE exchange, bearer-protected `tools/list` through the SDK client, refresh rotation, static API tokens, and the Access JWT check against a key pair generated in the test.
+- `node mcp/test/ui.test.mjs` (part of `npm test`) — the card layer through an in-memory client: the `ui://` resource is listed and readable with the MCP Apps mime type and image-host CSP, exactly the render tools link to it, the profile marker survives, and image references of every shape resolve.
 - `node mcp/test/boot.test.mjs` (part of `npm test`) — starts the real server over stdio and lists its tools. The rest of the offline suite imports lib modules directly and never loads `server.mjs`, so a broken tool registration would otherwise surface on a user's first call.
 - `npm run bench` (`node test/bench.mjs`) — scores match quality against the same recorded catalogs and prints the delta against `test/benchmarks/baseline.json` (`--save` adopts a new baseline). It deliberately does not report coverage, which lies: a run can fill every line while putting tomato pesto where tomatoes belong. It counts **correct** lines and **traps** — lines filled with the wrong thing, which is worse than a missing line because the user is told it's handled. Ground truth is per-market accept/reject name patterns, and each market scores against a pinned store so a matching change is measured on a fixed catalog rather than on whichever shop won that minute's race.
 

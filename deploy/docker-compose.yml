@@ -1,0 +1,24 @@
+# Remote wolt-mcp behind a Cloudflare Tunnel. Copy .env.example to .env, fill
+# it in, then `docker compose up -d --build`. Nothing listens on the host:
+# cloudflared dials out and forwards your hostname to the wolt-mcp container.
+# Without Cloudflare, drop the cloudflared service and put your own TLS
+# reverse proxy in front of wolt-mcp:3000.
+services:
+  wolt-mcp:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - wolt-data:/data
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.2.0
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - wolt-mcp
+
+volumes:
+  wolt-data:

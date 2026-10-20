@@ -14,6 +14,8 @@
 
 **Other MCP clients** — stdio config `{ "command": "npx", "args": ["-y", "wolt-mcp"] }`, or clone this repo, `cd mcp && npm install`, and point your client at `mcp/server.mjs`.
 
+**Remote / ChatGPT / Claude on your phone** — run it as an HTTPS endpoint behind OAuth with `node server.mjs --http` (a Dockerfile and compose file with a Cloudflare Tunnel are in `deploy/`), then add `https://your-host/mcp` as a custom MCP server in ChatGPT or a custom connector in Claude.ai. See [docs/remote.md](docs/remote.md).
+
 Requires Node 22+.
 
 Then in chat: *"Connect my Wolt account"* (a browser window opens in a separate profile; log in) → *"use my saved Wolt address"* → shop. Login needs a Chromium-based browser (Chrome, Edge, Brave, Chromium); Firefox/Safari users paste a token instead.
@@ -28,6 +30,7 @@ Full walkthrough in [docs/setup.md](docs/setup.md); internals in [docs/architect
 - **Browse** — venue details and opening hours, category trees, full menus (including large grocery catalogs), and dish option groups with required/conditional choices.
 - **Cart** — recipe → single-store plan, merge-safe basket writes with dish options, line editing, and a checkout preview showing your real total including delivery and fees.
 - **Account** — saved addresses, order history (so "order my usual" works), favorites, payment methods, geocoding.
+- **Pictures and ratings** — product and venue images and venue scores come with every result, and in ChatGPT and Claude the checkout preview renders as an inline card (MCP Apps) and any shortlist the model recommends ends in one `show_picks` card set with the photos, so you can shop by looking rather than by reading JSON.
 
 ## How it works
 

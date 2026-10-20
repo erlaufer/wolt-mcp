@@ -1,6 +1,7 @@
 // Wolt search + store-selection + basket building.
 // Search is unauthenticated (no bearer token needed); only the cart write is.
 import { woltFetch } from "./http.js";
+import { imageUrlOf } from "./ui.js";
 
 const SEARCH_URL = "https://restaurant-api.wolt.com/v1/pages/search";
 const BASKET_URL = "https://consumer-api.wolt.com/order-xp/v1/baskets";
@@ -92,7 +93,8 @@ export function normalizeSearchResponse(json, { mode = "grocery" } = {}) {
         country,
         isWeighted: !!entry.link?.menu_item_details?.is_sold_by_weight,
         unitSizeText: mi.unit_size_v2 || null,
-        image: mi.image?.url || null
+        image: mi.image?.url || null,
+        venueImage: imageUrlOf(mi.venue_image)
       });
     }
   }
