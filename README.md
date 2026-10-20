@@ -14,6 +14,8 @@
 
 **Other MCP clients** — stdio config `{ "command": "npx", "args": ["-y", "wolt-mcp"] }`, or clone this repo, `cd mcp && npm install`, and point your client at `mcp/server.mjs`.
 
+**Remote / ChatGPT / Claude on your phone** — run it as an HTTPS endpoint behind OAuth with `node server.mjs --http` (a Dockerfile and compose file with a Cloudflare Tunnel are in `deploy/`), then add `https://your-host/mcp` as a custom MCP server in ChatGPT or a custom connector in Claude.ai. See [docs/remote.md](docs/remote.md).
+
 Requires Node 22+.
 
 Then in chat: *"Connect my Wolt account"* (a browser window opens in a separate profile; log in) → *"use my saved Wolt address"* → shop. Login needs a Chromium-based browser (Chrome, Edge, Brave, Chromium); Firefox/Safari users paste a token instead.

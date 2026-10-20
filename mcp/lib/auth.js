@@ -16,19 +16,28 @@
 // Sources of truth, in order: the state file, then WOLT_BEARER_TOKEN /
 // WOLT_REFRESH_TOKEN env (seed on first run, e.g. from the .mcpb settings form).
 import { readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { woltHeaders } from "./headers.js";
+import { currentStateDir } from "./context.js";
 
 const AUTH_URL = "https://authentication.wolt.com/v1/wauth2/access_token";
-const STATE_DIR = process.env.WOLT_STATE_DIR || join(homedir(), ".wolt-mcp");
-const STATE_FILE = join(STATE_DIR, "tokens.json");
+// Resolved per call: the remote transport serves several accounts from one
+// process, each with its own directory (see context.js).
+const stateFile = () => join(currentStateDir(), "tokens.json");
 const EXPIRY_MARGIN_MS = 2 * 60 * 1000; // refresh when <2 min left
 
 // Shown (via a tool error) the first time an authed action is attempted with no
 // usable token. Written as an instruction to the client model so it relays a
 // warm, non-technical setup prompt to the user rather than dumping an error.
-export const NEEDS_TOKEN_MESSAGE = (hadExpired) =>
+//
+// A remote server (docs/remote.md) has no browser to drive, so the message
+// points at the local `npx -y wolt-mcp login` helper instead; serveHttp flips
+// the flag once at startup.
+let remoteMode = false;
+export function setRemoteMode(on) { remoteMode = !!on; }
+export function isRemoteMode() { return remoteMode; }
+
+export const NEEDS_TOKEN_MESSAGE = (hadExpired) => remoteMode ? NEEDS_TOKEN_MESSAGE_REMOTE(hadExpired) :
   `SETUP NEEDED — relay this to the user warmly, don't show it as an error:\n\n` +
   `${hadExpired ? "Your Wolt sign-in expired and I can't refresh it." : "To use your Wolt cart, I need to connect to your Wolt account once."} ` +
   `The easy way (no technical steps): I'll run login_via_chrome — a browser window opens on wolt.com, ` +
@@ -40,6 +49,15 @@ export const NEEDS_TOKEN_MESSAGE = (hadExpired) =>
   `payload, and paste it here — I'll store it with set_wolt_token.\n\n` +
   `(Searching stores works without this — it's only needed for your cart and account.)`;
 
+const NEEDS_TOKEN_MESSAGE_REMOTE = (hadExpired) =>
+  `SETUP NEEDED — relay this to the user warmly, don't show it as an error:\n\n` +
+  `${hadExpired ? "Your Wolt sign-in expired and this server can't refresh it." : "To use your Wolt cart, this server needs to be connected to your Wolt account once."} ` +
+  `This wolt-mcp runs on a remote server, so there is no browser login here. Ask them to: log in at wolt.com, ` +
+  `open the browser's developer tools (F12 or Option-Command-I) → Network tab, reload the page, find the request to ` +
+  `authentication.wolt.com/v1/wauth2/access_token, and copy the "refresh_token" value from its JSON. ` +
+  `Paste that token here and I'll store it with set_wolt_token — it renews itself afterwards.\n\n` +
+  `(Searching stores works without this — it's only needed for your cart and account.)`;
+
 export function jwtExpiryMs(token) {
   try {
     const payload = JSON.parse(Buffer.from(String(token).replace(/^Bearer /i, "").split(".")[1], "base64url").toString());
@@ -48,13 +66,13 @@ export function jwtExpiryMs(token) {
 }
 
 function loadState() {
-  try { return JSON.parse(readFileSync(STATE_FILE, "utf8")); } catch (e) { return {}; }
+  try { return JSON.parse(readFileSync(stateFile(), "utf8")); } catch (e) { return {}; }
 }
 
 function saveState(state) {
-  mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  try { chmodSync(STATE_FILE, 0o600); } catch (e) {}
+  mkdirSync(currentStateDir(), { recursive: true });
+  writeFileSync(stateFile(), JSON.stringify(state, null, 2), { mode: 0o600 });
+  try { chmodSync(stateFile(), 0o600); } catch (e) {}
 }
 
 // Merge env seeds into the store (env never overwrites a NEWER stored pair —
@@ -194,6 +212,35 @@ export function describeTokens() {
     accessTokenMinutesLeft: exp ? Math.round((exp - Date.now()) / 60000) : null,
     refreshTokenStored: !!(state.refreshToken || state.rotatedRefreshToken),
     autoRefresh: !!(state.refreshToken || state.rotatedRefreshToken),
-    stateFile: STATE_FILE
+    stateFile: stateFile()
   };
+}
+
+// Proves a pasted refresh token works by exchanging it once. Wolt rotates on
+// every exchange, so the caller gets back BOTH the pair to store and must not
+// try the pasted value again — adoptTokens() below records them correctly.
+export async function validateRefreshToken(pasted) {
+  const refreshToken = unwrapToken(pasted);
+  if (!refreshToken) throw new Error("empty token");
+  const { access, refresh } = await postRefresh(refreshToken);
+  return { refreshToken, rotatedRefreshToken: refresh, accessToken: access };
+}
+
+// Writes a validated pair into the current state dir: the pasted token stays
+// pinned as the bootstrap, the rotation it produced goes in its own slot.
+export function adoptTokens({ refreshToken, rotatedRefreshToken, accessToken }) {
+  const state = loadState();
+  state.refreshToken = refreshToken;
+  state.rotatedRefreshToken = rotatedRefreshToken || null;
+  state.accessToken = accessToken;
+  delete state.refreshRotated;
+  saveState(state);
+  return describeTokens();
+}
+
+// The freshest refresh token we hold — the latest rotation, else the bootstrap
+// — for `wolt-mcp login` to print so it can be pasted into a remote server.
+export function exportRefreshToken() {
+  const state = currentState();
+  return state.rotatedRefreshToken || state.refreshToken || null;
 }

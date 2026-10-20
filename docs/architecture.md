@@ -16,7 +16,13 @@ mcp/lib/
   account.js       order history, geocoding
   cdp-login.js     zero-paste browser login over the DevTools Protocol
   config.js        saved location
+  remote.js        Streamable HTTP transport (stateless) and its routes
+  oauth.js         the OAuth 2.1 server in front of it, Cloudflare Access JWT check
+  context.js       per-request state directory (one Wolt account per OAuth grant)
+deploy/            Dockerfile, compose file with a Cloudflare Tunnel connector
 ```
+
+`server.mjs` collects the tools in a registry and `buildServer()` applies them: stdio builds one server for the life of the process, the HTTP transport builds one per request. Each tool carries annotations (`readOnlyHint` and friends) from a single table, and a test fails if a tool is missing from it.
 
 ## Requests
 
@@ -80,6 +86,14 @@ of them knows. Callers then refuse the write with a message asking for a
 currency. Nothing defaults to a particular market's money: a wrong currency is
 a silent pricing bug, not a recoverable one.
 
+## Remote transport
+
+`--http` serves the same tools over Streamable HTTP at `/mcp`, stateless: a fresh `McpServer` plus transport per request, torn down when the response closes. No session ids, so there is nothing to lose across restarts and `GET /mcp` is a 405. Only `login_via_chrome` is withheld — a server has no browser — and the token-setup message points at `npx -y wolt-mcp login` on the user's own machine instead.
+
+Auth is OAuth 2.1 served by `oauth.js`: protected-resource and authorization-server metadata, open dynamic client registration, PKCE-only authorization codes (in memory, ten minutes, single use), opaque bearer and rotating refresh tokens stored hashed in `oauth.json`. The human check sits on `/authorize` and is one of two guards: Cloudflare Access in front of that path (the server verifies the `Cf-Access-Jwt-Assertion` RS256 JWT against the team's JWKS — signature, issuer, audience, expiry) or a shared approve secret. Either way the user clicks Allow on a same-origin form; auto-approval would let any registered client lift a code from a logged-in browser. `WOLT_API_TOKENS` adds fixed bearer tokens for header-only clients.
+
+Every grant brings its own Wolt account; the server holds none to share. The refresh token pasted on the approve page is exchanged once, stored under `accounts/<id>/` in the state dir, and the id travels on the grant's tokens through every refresh. `context.js` holds the request's state directory in an `AsyncLocalStorage`; `auth.js` and `config.js` resolve their files through it instead of constants, so tokens and the saved location are per account without the tool code knowing. Remotely the IP-based location guess is off — it would point at the server. Details and deployment in [remote.md](remote.md).
+
 ## Testing
 
 - `npm test` — offline unit tests (no network, no credentials), including a release guard that package.json, manifest.json and the lockfile carry the same version.
@@ -87,6 +101,7 @@ a silent pricing bug, not a recoverable one.
 - `node test/mcp.live.mjs` — lower-level live check of the lib layer directly (refresh → search → basket write → merge/persist verification → cleanup), bypassing the MCP protocol. Needs real credentials and writes a temporary basket to your account.
 - `node mcp/test/tools.live.mjs` — drives every tool through a real stdio MCP client against a live account. Cart tests use a temporary basket and clean up; favorites tests are self-reversing; `set_wolt_token` round-trips the tokens already on disk rather than writing a dummy. A coverage guard compares the tools actually called against `listTools()` and fails the run on any gap, so a newly added tool can't go untested. Only `login_via_chrome` is skipped, being interactive.
 
+- `node mcp/test/remote.test.mjs` (part of `npm test`) — the HTTP transport in-process on a loopback port: discovery, client registration, the approve page (wrong secret, cross-site post, the real thing), PKCE exchange, bearer-protected `tools/list` through the SDK client, refresh rotation, static API tokens, and the Access JWT check against a key pair generated in the test.
 - `node mcp/test/boot.test.mjs` (part of `npm test`) — starts the real server over stdio and lists its tools. The rest of the offline suite imports lib modules directly and never loads `server.mjs`, so a broken tool registration would otherwise surface on a user's first call.
 - `npm run bench` (`node test/bench.mjs`) — scores match quality against the same recorded catalogs and prints the delta against `test/benchmarks/baseline.json` (`--save` adopts a new baseline). It deliberately does not report coverage, which lies: a run can fill every line while putting tomato pesto where tomatoes belong. It counts **correct** lines and **traps** — lines filled with the wrong thing, which is worse than a missing line because the user is told it's handled. Ground truth is per-market accept/reject name patterns, and each market scores against a pinned store so a matching change is measured on a fixed catalog rather than on whichever shop won that minute's race.
 
