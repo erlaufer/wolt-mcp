@@ -43,7 +43,8 @@ export function resolveCurrency({ currency = null, venue = null, candidates = []
 }
 
 // Search items near a location. Returns normalized candidates.
-// mode: "grocery" (default, drops restaurant dishes) or "restaurant" (dishes only).
+// mode: "grocery" (default, store products of every product line, restaurant
+// dishes dropped) or "restaurant" (dishes only).
 // fetchImpl lets tests/extension inject a fetch (default global fetch).
 // Goes through woltFetch like everything else: search is the widest fan-out in
 // the server (one call per ingredient in plan_cart's first pass), so it has to
@@ -74,9 +75,12 @@ export function normalizeSearchResponse(json, { mode = "grocery" } = {}) {
       if (!mi || !mi.id || !mi.venue_id) continue;
       if (mi.is_available === false) continue;
       const details = entry.link?.menu_item_details || {};
-      // product_line separates groceries from restaurant dishes; entries with
-      // no product_line are treated as grocery (the historical behavior).
-      const isGrocery = !details.product_line || details.product_line === "grocery";
+      // product_line separates restaurant dishes from store products. Only
+      // "restaurant" is a dish: pharmacy, health_and_beauty, alcohol,
+      // electronics and general_merchandise are store products like grocery.
+      // Entries with no product_line count as store products (the historical
+      // behavior).
+      const isGrocery = details.product_line !== "restaurant";
       if (mode === "grocery" ? !isGrocery : isGrocery) continue;
       const country = (mi.country || details.country || "").toLowerCase() || null;
       out.push({
