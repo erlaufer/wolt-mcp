@@ -14,7 +14,9 @@
 const SCRIPTS = [
   { re: /[֐-׿]/, lang: "he", written: ["he"] },
   { re: /[؀-ۿ]/, lang: "ar", written: ["ar"] },
-  { re: /[Ѐ-ӿ]/, lang: "ru", written: ["ru", "uk", "be", "kk", "ky", "bg", "sr", "mk"] },
+  // Serbian is digraphic and Wolt's Serbian catalogs are indexed in Latin, so
+  // "sr" is deliberately absent here.
+  { re: /[Ѐ-ӿ]/, lang: "ru", written: ["ru", "uk", "be", "kk", "ky", "bg", "mk"] },
   { re: /[Ͱ-Ͽ]/, lang: "el", written: ["el"] },
   { re: /[Ⴀ-ჿ]/, lang: "ka", written: ["ka"] },
   { re: /[぀-ヿ㐀-鿿]/, lang: "ja", written: ["ja"] }
