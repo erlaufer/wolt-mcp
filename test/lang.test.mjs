@@ -18,6 +18,7 @@ if (langOf("800 גרם עגבניות") !== "he") fail("mixed digits+hebrew -> h
 if (!isNonLatinLang("he") || !isNonLatinLang("ka") || !isNonLatinLang("el") || !isNonLatinLang("ja")) fail("non-latin catalogs");
 if (!isNonLatinLang("kk")) fail("kazakh is cyrillic-script");
 if (isNonLatinLang("en") || isNonLatinLang("de") || isNonLatinLang("fi") || isNonLatinLang(null) || isNonLatinLang("")) fail("latin/unknown catalogs");
+if (isNonLatinLang("sr")) fail("serbian catalogs on Wolt are latin-script");
 
 // sameScript: is the text written in the catalog language's script?
 if (sameScript("crushed tomatoes", "el")) fail("english text vs greek catalog");
@@ -29,5 +30,6 @@ if (sameScript("томат", "ka")) fail("cyrillic text vs georgian catalog");
 if (!sameScript("томат", "kk")) fail("cyrillic text vs kazakh catalog (same script)");
 if (sameScript("トマト", "de")) fail("japanese text vs latin catalog");
 if (!sameScript("1 kg tomatoes", null)) fail("latin text vs unknown catalog language");
+if (!sameScript("600 g pileći file", "sr")) fail("serbian latin text vs serbian catalog");
 
 console.log("✓ lang tests passed");
