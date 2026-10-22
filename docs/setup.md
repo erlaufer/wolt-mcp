@@ -1,6 +1,6 @@
 # Setup — use Wolt from your AI tool
 
-This connects Wolt to any MCP-capable AI client. You review and check out on wolt.com yourself — nothing is ever ordered automatically.
+This connects Wolt to any MCP-capable AI client. By default you review and check out on wolt.com yourself; ordering from the chat is off unless you switch it on for a connection (see `prepare_order` below).
 
 ## 1. Install
 
@@ -71,7 +71,8 @@ When your basket is ready, the AI gives you the wolt.com link — you review and
 | `get_baskets` | yes | List your baskets and line items |
 | `update_cart_item` | yes | Change a line's count or remove it |
 | `clear_basket` | yes | Delete a basket |
-| `checkout_preview` | yes | Total incl. fees/delivery — read-only, never orders |
+| `checkout_preview` | yes | Total incl. fees/delivery — read-only, orders nothing |
+| `prepare_order` / `place_order` | yes | Quote the basket with your saved address and card, then pay. Off unless the connection was approved for ordering (approve page, or `WOLT_ALLOW_ORDERS=1` for a local server; `WOLT_ORDER_CAP` sets a per-order limit). Saved card only; lines with options are refused |
 | `login_via_chrome` / `set_wolt_token` | — | Connect your account |
 | `get_wolt_profile` | yes | Your Wolt profile (saved addresses) |
 | `set_location` / `wolt_status` | no | Location default / connection status |
@@ -84,4 +85,4 @@ When your basket is ready, the AI gives you the wolt.com link — you review and
 
 ## Disclaimers
 
-Unofficial project using Wolt's private consumer APIs — not affiliated with or endorsed by Wolt. Endpoints can change without notice. Personal use; never automates payment.
+Unofficial project using Wolt's private consumer APIs — not affiliated with or endorsed by Wolt. Endpoints can change without notice. Personal use; pays only on a connection you switched ordering on for, after you confirm the total.

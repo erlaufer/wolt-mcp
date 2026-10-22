@@ -111,10 +111,11 @@ export async function planAtVenue(venue_slug, ingredients) {
           : null;
       lineItems.push({
         ingredient: raw, name: best.name, itemId: best.itemId, price: best.price,
+        ...(best.imageUrl || best.image ? { imageUrl: best.imageUrl || best.image } : {}),
         confidence: check ? "low" : "high",
         ...(check ? { check } : {}),
         ...(best.isWeighted ? { isWeighted: true, sellByWeight: best.sellByWeight } : {}),
-        alternatives: ranked.slice(1).map((c) => ({ name: c.name, itemId: c.itemId, price: c.price }))
+        alternatives: ranked.slice(1).map((c) => ({ name: c.name, itemId: c.itemId, price: c.price, ...(c.imageUrl || c.image ? { imageUrl: c.imageUrl || c.image } : {}) }))
       });
     } else if (hits.length) {
       unmatched.push({ ingredient: raw, candidates: hits.slice(0, 3).map((c) => ({ name: c.name, itemId: c.itemId, price: c.price })) });

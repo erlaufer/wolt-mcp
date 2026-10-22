@@ -57,4 +57,20 @@ r = await woltFetch("https://x.test/f", {
 });
 if (!r.ok || r.json?.v !== 4 || sawAuthHeader !== undefined) fail("auth-false path");
 
+// auth: "optional" — a connected account is used, a missing one is not an error.
+r = await woltFetch("https://x.test/e", {
+  auth: "optional",
+  fetchImpl: async (url, init) => { sawAuthHeader = init.headers.authorization; return mkRes(200, '{"v":5}'); }
+});
+if (!r.ok || r.json?.v !== 5 || !sawAuthHeader) fail("optional auth uses the stored token");
+{
+  const { withStateDir } = await import("../mcp/lib/context.js");
+  const empty = mkdtempSync(join(tmpdir(), "wolt-http-empty-"));
+  r = await withStateDir(empty, () => woltFetch("https://x.test/f", {
+    auth: "optional",
+    fetchImpl: async (url, init) => { sawAuthHeader = init.headers.authorization; return mkRes(200, '{"v":6}'); }
+  }));
+  if (!r.ok || r.json?.v !== 6 || sawAuthHeader !== undefined) fail("optional auth goes anonymous without a token");
+}
+
 console.log("http.test.mjs: all assertions passed");

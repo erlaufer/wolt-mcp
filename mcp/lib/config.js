@@ -1,22 +1,22 @@
 // Persistent user settings (delivery location) in ~/.wolt-mcp/config.json.
 // Precedence: stored config > WOLT_LAT/WOLT_LON env seeds > cached IP estimate.
 import { readFileSync, writeFileSync, mkdirSync, chmodSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { currentStateDir } from "./context.js";
 
-const STATE_DIR = process.env.WOLT_STATE_DIR || join(homedir(), ".wolt-mcp");
-const CONFIG_FILE = join(STATE_DIR, "config.json");
+// Per call, not a constant: each remote account has its own directory.
+const configFile = () => join(currentStateDir(), "config.json");
 
 // This file holds the user's home coordinates — keep it owner-only, as tokens
 // are. Applied on read too: a config.json written before this existed keeps its
 // 0644 mode otherwise, since nothing rewrites it until the next set_location.
 function harden() {
-  try { if (statSync(CONFIG_FILE).mode & 0o077) chmodSync(CONFIG_FILE, 0o600); } catch (e) {}
+  try { if (statSync(configFile()).mode & 0o077) chmodSync(configFile(), 0o600); } catch (e) {}
 }
 
 function load() {
   let raw;
-  try { raw = readFileSync(CONFIG_FILE, "utf8"); } catch (e) { return {}; }
+  try { raw = readFileSync(configFile(), "utf8"); } catch (e) { return {}; }
   harden();
   try { return JSON.parse(raw); } catch (e) { return {}; }
 }
@@ -55,8 +55,8 @@ export async function estimateLocation(fetchImpl = fetch) {
   const label = [j.city, j.country_name].filter(Boolean).join(", ") + " (estimated from IP)";
   const cfg = load();
   cfg.ipEstimate = { lat: j.latitude, lon: j.longitude, label, at: Date.now() };
-  mkdirSync(STATE_DIR, { recursive: true });
-  writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  mkdirSync(currentStateDir(), { recursive: true });
+  writeFileSync(configFile(), JSON.stringify(cfg, null, 2), { mode: 0o600 });
   harden();
   return { lat: j.latitude, lon: j.longitude, label };
 }
@@ -64,10 +64,10 @@ export async function estimateLocation(fetchImpl = fetch) {
 export function setLocation({ lat, lon, label }) {
   const cfg = load();
   cfg.location = { lat, lon, label: label || null };
-  mkdirSync(STATE_DIR, { recursive: true });
+  mkdirSync(currentStateDir(), { recursive: true });
   // mode covers the create case, so the coordinates are never on disk
   // world-readable; harden() covers a file that already existed.
-  writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+  writeFileSync(configFile(), JSON.stringify(cfg, null, 2), { mode: 0o600 });
   harden();
   return cfg.location;
 }

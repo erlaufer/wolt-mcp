@@ -5,11 +5,15 @@
 // resolve it from the venue's assortment (and per-item venue pages as a
 // fallback); as a last resort we fall back to the item id itself, which
 // the endpoint accepts.
+//
+// loadBasketPlan() is the shared first half — basket, venue, currency and the
+// priced menu_items — used by the preview here and by the order quote in
+// order.js, so the two always price the same lines the same way.
 import { woltFetch } from "./http.js";
 import { BASKETS_PAGE_URL, findBasketForVenue, resolveCurrency } from "./wolt.js";
 import { getVenue } from "./venue.js";
 
-const CHECKOUT_URL = "https://consumer-api.wolt.com/order-xp/web/v2/pages/checkout";
+export const CHECKOUT_URL = "https://consumer-api.wolt.com/order-xp/web/v2/pages/checkout";
 const ASSORTMENT_BASE = "https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/";
 const VENUE_ITEM_BASE = "https://consumer-api.wolt.com/order-xp/web/v1/pages/venue/";
 
@@ -44,9 +48,10 @@ async function tryFetchJson(url, opts) {
   } catch (e) { return null; }
 }
 
-// Preview checkout for the user's existing basket at one venue.
-// Returns { payableAmount, rows, deliveryConfigs, offers, warnings, raw }.
-export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, country = null, tip = 0, promoCode = null }) {
+// The user's basket at one venue, priced the way the checkout endpoint wants
+// it. Returns { basket, venue, venueId, slug, currency, country, menuItems,
+// lines, warnings }; throws when there is no basket or the market is unknown.
+export async function loadBasketPlan({ venueId, venueSlug = null, lat, lon, country = null }) {
   const warnings = [];
   const pageRes = await woltFetch(`${BASKETS_PAGE_URL}?lat=${lat}&lon=${lon}`);
   if (!pageRes.ok) throw new Error(`baskets fetch failed: HTTP ${pageRes.status}`);
@@ -119,12 +124,31 @@ export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, cou
       }))
     });
   }
+  return { basket, venue, venueId: resolvedVenueId, slug, currency, country: venueCountry.toUpperCase(), menuItems, lines: basket.items || [], warnings };
+}
 
+// Rows of a checkout page, flattened to { label, amount, formatted }.
+export function checkoutRows(j) {
+  return (j.checkout_rows || []).map((row) => {
+    // observed live: row.amount is { amount, formatted_amount, reason }
+    const a = row.amount_row?.amount ?? row.price_total_amount_row?.amount ?? row.amount;
+    return {
+      label: row.label || row.title || null,
+      amount: typeof a === "number" ? a : a?.amount ?? null,
+      formatted: a?.formatted_amount ?? null
+    };
+  }).filter((r) => r.label || r.amount != null);
+}
+
+// Preview checkout for the user's existing basket at one venue.
+// Returns { payableAmount, rows, deliveryConfigs, offers, warnings, raw }.
+export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, country = null, tip = 0, promoCode = null }) {
+  const plan = await loadBasketPlan({ venueId, venueSlug, lat, lon, country });
   const payload = {
     purchase_plan: {
-      venue: { id: resolvedVenueId, currency, country: venueCountry.toUpperCase() },
+      venue: { id: plan.venueId, currency: plan.currency, country: plan.country },
       delivery_method: "homedelivery",
-      menu_items: menuItems,
+      menu_items: plan.menuItems,
       use_promo_discount_ids: promoCode ? [promoCode] : [],
       courier_tip: tip,
       use_cash: false,
@@ -142,20 +166,12 @@ export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, cou
   const j = r.json || {};
   return {
     payableAmount: j.payable_amount ?? null,
-    currency,
-    rows: (j.checkout_rows || []).map((row) => {
-      // observed live: row.amount is { amount, formatted_amount, reason }
-      const a = row.amount_row?.amount ?? row.price_total_amount_row?.amount ?? row.amount;
-      return {
-        label: row.label || row.title || null,
-        amount: typeof a === "number" ? a : a?.amount ?? null,
-        formatted: a?.formatted_amount ?? null
-      };
-    }).filter((r) => r.label || r.amount != null),
+    currency: plan.currency,
+    rows: checkoutRows(j),
     deliveryConfigs: j.delivery_configs ?? null,
     offers: j.offers ?? null,
     tipConfig: j.tip_config ?? null,
-    warnings,
+    warnings: plan.warnings,
     raw: j
   };
 }
