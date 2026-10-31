@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wolt</title>
+<style>
+  :root{--bg:#fff;--fg:#111;--muted:#6b6b6b;--line:#e6e6e6;--card:#fff;--accent:#009de0;--chip:#f1f5f9;--ok:#1a7f37;--warn:#b45309}
+  :root[data-theme="dark"]{--bg:#111;--fg:#f2f2f2;--muted:#a0a0a0;--line:#2a2a2a;--card:#1a1a1a;--accent:#38bdf8;--chip:#262626;--ok:#4ade80;--warn:#fbbf24}
+  @media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--bg:#111;--fg:#f2f2f2;--muted:#a0a0a0;--line:#2a2a2a;--card:#1a1a1a;--accent:#38bdf8;--chip:#262626;--ok:#4ade80;--warn:#fbbf24}}
+  *{box-sizing:border-box}
+  body{margin:0;padding:12px;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+  h2{font-size:15px;margin:0 0 10px;font-weight:650}
+  .muted{color:var(--muted)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;display:flex;flex-direction:column;min-width:0}
+  .card.row{flex-direction:row;align-items:center;gap:10px;padding:8px}
+  .img{width:100%;aspect-ratio:4/3;object-fit:cover;background:var(--chip);display:block}
+  .row .img{width:64px;height:64px;aspect-ratio:1;border-radius:8px;flex:none}
+  .ph{display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:24px}
+  .body{padding:8px 10px 10px;display:flex;flex-direction:column;gap:3px;min-width:0;flex:1}
+  .name{font-weight:600;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+  .price{font-weight:650}
+  .sub{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .chips{display:flex;flex-wrap:wrap;gap:4px;margin-top:2px}
+  .chip{font-size:11px;padding:2px 7px;border-radius:999px;background:var(--chip);color:var(--fg)}
+  .chip.ok{color:var(--ok)}.chip.warn{color:var(--warn)}
+  .actions{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+  .actions[hidden]{display:none}
+  button{font:inherit;font-size:12px;padding:5px 10px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
+  button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  button:disabled{opacity:.55;cursor:default}
+  .hero{width:100%;aspect-ratio:16/7;object-fit:cover;border-radius:12px;background:var(--chip);display:block;margin-bottom:10px}
+  table{width:100%;border-collapse:collapse}
+  td{padding:6px 0;border-bottom:1px solid var(--line);vertical-align:top}
+  td:last-child{text-align:right;white-space:nowrap}
+  tr.total td{font-weight:700;border-bottom:0}
+  .list{display:flex;flex-direction:column;gap:8px}
+  .note{font-size:12px;color:var(--muted);margin-top:8px}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div id="root" class="muted">Loading…</div>
+<!-- PAYMENT_SDK -->
+<script>
+(function () {
+  "use strict";
+  // The root comes first: ChatGPT has window.openai.toolOutput ready before
+  // this script runs, so the first render happens during the bridge setup.
+  var root = document.getElementById("root");
+  var rendered = false;
+  // ---- host bridge: MCP Apps (JSON-RPC over postMessage), with ChatGPT's
+  // window.openai globals as a fallback for hosts that still only speak those.
+  var PROTOCOL = "2026-01-26";
+  var nextId = 1, pending = {};
+  function send(msg) { try { window.parent.postMessage(msg, "*"); } catch (e) {} }
+  function request(method, params) {
+    return new Promise(function (resolve, reject) {
+      var id = nextId++;
+      pending[id] = { resolve: resolve, reject: reject };
+      send({ jsonrpc: "2.0", id: id, method: method, params: params || {} });
+    });
+  }
+  function notify(method, params) { send({ jsonrpc: "2.0", method: method, params: params || {} }); }
+  var hostContext = {};
+  window.addEventListener("message", function (ev) {
+    var m = ev.data;
+    if (ev.source !== window.parent) return;
+    if (!m || m.jsonrpc !== "2.0") return;
+    if (m.id != null && pending[m.id]) { var r = pending[m.id]; delete pending[m.id]; if (m.error) r.reject(new Error(m.error.message || "Host tool call failed")); else r.resolve(m.result || {}); return; }
+    if (m.method === "ui/notifications/tool-result" && m.params) render(m.params.structuredContent);
+    else if (m.method === "ui/notifications/host-context-changed" && m.params) applyContext(m.params);
+  });
+  function applyContext(ctx) {
+    for (var k in ctx) hostContext[k] = ctx[k];
+    if (hostContext.theme) document.documentElement.setAttribute("data-theme", hostContext.theme);
+    if (hostContext.locale) document.documentElement.lang = hostContext.locale;
+  }
+  // ChatGPT globals: data may already be there, arrive via a globals event
+  // (whose detail.globals carries the changed values), or show up later
+  // without any event, so this is also polled for a while. The payload has
+  // been seen bare, wrapped as {result: {structuredContent}}, and only inside
+  // toolResponseMetadata (the full tool-result envelope); the text content
+  // block carries the same JSON, so that is the last resort.
+  function unwrap(x, depth) {
+    depth = depth || 0;
+    if (!x || typeof x !== "object" || depth > 4) return null;
+    if (typeof x.view === "string") return x;
+    var keys = ["structuredContent", "result", "call_tool_result", "mcp_tool_result", "toolOutput"];
+    for (var i = 0; i < keys.length; i++) { var r = unwrap(x[keys[i]], depth + 1); if (r) return r; }
+    if (Array.isArray(x.content)) {
+      for (var j = 0; j < x.content.length; j++) {
+        var c = x.content[j];
+        if (c && c.type === "text" && typeof c.text === "string" && c.text.charAt(0) === "{") {
+          try { var parsed = JSON.parse(c.text); if (parsed && typeof parsed.view === "string") return parsed; } catch (e) {}
+        }
+      }
+    }
+    return null;
+  }
+  function fromOpenAI(ev) {
+    if (rendered) return;
+    var g = (ev && ev.detail && ev.detail.globals) || {};
+    var o = window.openai || {};
+    var theme = g.theme || o.theme;
+    if (theme) document.documentElement.setAttribute("data-theme", theme);
+    var out = unwrap(g.toolOutput) || unwrap(o.toolOutput) || unwrap(g.toolResponseMetadata) || unwrap(o.toolResponseMetadata);
+    if (out) render(out);
+  }
+  // What the host did hand over, for the fallback message: each global and
+  // whether it holds anything.
+  function globalsSummary() {
+    var o = window.openai;
+    if (!o) return "no ChatGPT globals; MCP Apps host sent no tool result";
+    var names = ["toolInput", "toolOutput", "toolResponseMetadata", "widgetState", "displayMode", "theme", "locale"], parts = [];
+    for (var i = 0; i < names.length; i++) {
+      var v = o[names[i]];
+      parts.push(names[i] + "=" + (v == null ? "null" : typeof v === "object" ? (Array.isArray(v) ? "array" : "{" + Object.keys(v).slice(0, 6).join(",") + "}") : String(v).slice(0, 12)));
+    }
+    return "ChatGPT globals: " + parts.join(" ");
+  }
+
+  // Talk back through the host: a follow-up message goes to the model, so a
+  // card can ask for a menu or an add-to-cart without doing it behind its back.
+  function say(text) {
+    if (window.openai && window.openai.sendFollowUpMessage) return window.openai.sendFollowUpMessage({ prompt: text });
+    request("ui/message", { role: "user", content: { type: "text", text: text } });
+  }
+  function open(url) {
+    if (window.openai && window.openai.openExternal) return window.openai.openExternal({ href: url });
+    request("ui/open-link", { url: url }).then(function (r) { if (r && r.isError) window.open(url, "_blank", "noopener"); }).catch(function () { window.open(url, "_blank", "noopener"); });
+  }
+  function callTool(name, args) {
+    var o = window.openai;
+    var result = o && typeof o.callTool === "function" ? o.callTool(name, args) : request("tools/call", { name: name, arguments: args });
+    return Promise.resolve(result).then(function (r) {
+      if (r && r.isError) throw new Error((r.content || []).map(function (c) { return c.text || ""; }).join(" ") || "Tool call failed");
+      if (r && r.structuredContent) return r.structuredContent;
+      var text = (r && r.content || []).find(function (c) { return c.type === "text"; });
+      if (text) { try { return JSON.parse(text.text); } catch (e) { throw new Error(text.text); } }
+      throw new Error("The host returned no tool result");
+    });
+  }
+  var checkoutGeneration = 0;
+  var activeCheckout = null;
+  var paymentResults = {};
+  function publishPaymentResult(c, result) {
+    paymentResults[c.quoteId] = result;
+    var modelContent = JSON.stringify({ quoteId: c.quoteId, paymentResult: result, instruction: "The user already clicked Confirm and pay. This is the result of that attempt; do not ask for another confirmation or resubmit this quote. If payment is unconfirmed, check get_order_history/get_order, not get_baskets, before proposing another purchase." });
+    var o = window.openai;
+    if (o && typeof o.setWidgetState === "function") {
+      try { o.setWidgetState({ modelContent: modelContent, privateContent: { quoteId: c.quoteId, paymentResult: result } }); } catch (e) { /* context sync still works without persistence */ }
+    }
+    request("ui/update-model-context", { content: [{ type: "text", text: modelContent, annotations: { audience: ["assistant"] } }] }).catch(function () { /* older hosts may only support widget state */ });
+  }
+  function rememberedPaymentResult(c) {
+    if (paymentResults[c.quoteId]) return paymentResults[c.quoteId];
+    var saved = window.openai && window.openai.widgetState && window.openai.widgetState.privateContent;
+    return saved && saved.quoteId === c.quoteId && saved.paymentResult && typeof saved.paymentResult.ok === "boolean" ? saved.paymentResult : null;
+  }
+  function showPaymentResult(c, result, publish) {
+    ++checkoutGeneration;
+    var title = result.ok ? "Order placed" : result.code === "payment_declined" ? "Payment not authorized" : "Payment not confirmed";
+    var link = "https://wolt.com";
+    try { var u = new URL(result.checkoutUrl); if (u.protocol === "https:" && (u.hostname === "wolt.com" || u.hostname.endsWith(".wolt.com"))) link = u.href; } catch (e) {}
+    root.innerHTML = '<h2>' + esc(title) + '</h2><p>' + esc(result.venue || c.venue) + '</p>' +
+      (result.ok ? '<p><strong>' + esc(result.total || money(c.payableAmount, c.currency)) + '</strong>' + (result.eta ? ' · ' + esc(result.eta) : '') + '</p>' : '<p class="muted">Quoted total: ' + esc(money(c.payableAmount, c.currency)) + '</p>') +
+      '<p role="status">' + esc(result.note || "Check this order in Wolt before trying again.") + '</p><div class="actions"><button data-act="' + act(function () { open(link); }) + '">Open Wolt</button></div>';
+    if (publish) publishPaymentResult(c, result);
+  }
+  function prepareCheckout(c) {
+    var remembered = rememberedPaymentResult(c);
+    if (remembered) { showPaymentResult(c, remembered, false); return; }
+    var generation = ++checkoutGeneration;
+    var pay = document.getElementById("confirm-pay"), status = document.getElementById("payment-status"), fallback = document.getElementById("payment-fallback");
+    if (!pay || !status) return;
+    var submitting = false;
+    var expiresAt = Date.now() + c.expiresInSeconds * 1000;
+    // WebKit embeds may have different/ephemeral device storage from the
+    // in-app browser. Use the browser page there until inline payment is
+    // verified; re-use its preparation rather than replacing it per card.
+    var appleMobile = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+    var needsBrowser = window.parent !== window && appleMobile && c.paymentContextSource !== "browser" && !!c.paymentContextUrl;
+    function ready() {
+      pay.disabled = false;
+      if (Date.now() >= expiresAt) { pay.textContent = "Refresh total"; status.textContent = "Browser ready. Refresh the total, then confirm the new quote."; }
+      else status.textContent = "Ready. Confirm the total to place this order.";
+      if (fallback) fallback.hidden = true;
+    }
+    function watchBrowserPreparation() {
+      var startedAt = Date.now(), checking = false;
+      async function check() {
+        if (generation !== checkoutGeneration || submitting || checking) return;
+        checking = true;
+        try {
+          var value = await Promise.race([callTool("get_order_payment_context", { quote_id: c.quoteId, require_browser: true }), new Promise(function (_, reject) { setTimeout(function () { reject(new Error("Preparation check timed out")); }, 8000); })]);
+          if (generation !== checkoutGeneration) return;
+          if (value.ready && !value.submitted) { stop(); ready(); }
+        } catch (e) { /* leave the preparation link available */ }
+        finally { checking = false; }
+      }
+      function visible() { if (!document.hidden) check(); }
+      function stop() { clearInterval(timer); window.removeEventListener("focus", check); document.removeEventListener("visibilitychange", visible); }
+      var timer = setInterval(function () { if (generation !== checkoutGeneration || Date.now() - startedAt > 300000) stop(); else if (!document.hidden) check(); }, 5000);
+      window.addEventListener("focus", check);
+      document.addEventListener("visibilitychange", visible);
+      check();
+    }
+    pay.onclick = async function () {
+      if (submitting || pay.disabled || generation !== checkoutGeneration) return;
+      if (Date.now() >= expiresAt && c.repriceArguments) {
+        pay.disabled = true; status.textContent = "Refreshing the total…";
+        try { render(await callTool("prepare_order", c.repriceArguments)); }
+        catch (e) { status.textContent = "Could not refresh this quote. Ask for a fresh quote in chat. No purchase was submitted by this refresh."; pay.disabled = false; }
+        return;
+      }
+      submitting = true; pay.disabled = true; status.textContent = "Submitting your confirmed order…";
+      // Only this explicit button click can submit. SDK preparation never
+      // calls place_order, and a failed/ambiguous submission is never retried.
+      try {
+        var result = await callTool("place_order", { quote_id: c.quoteId, total: c.payableAmount });
+        if (generation !== checkoutGeneration) return;
+        showPaymentResult(c, result, true);
+      } catch (e) {
+        var message = e.message || "The payment outcome is unknown.";
+        if (/Local device preparation|the quote expired|that quote is unknown/i.test(message)) {
+          submitting = false; pay.disabled = false;
+          if (/the quote expired|that quote is unknown/i.test(message)) { expiresAt = 0; pay.textContent = "Refresh total"; }
+          status.textContent = expiresAt === 0 ? "This quote expired. Refresh the total and confirm the new quote." : "Device preparation is not ready. Open the preparation link, then return to this card.";
+          if (fallback) fallback.hidden = false;
+        } else {
+          // Compatibility with hosts that still wrap old isError responses.
+          // Never put Python/SDK objects or internal exceptions into the card.
+          var declined = /error 800|could not authorize|card was declined|already refused|declined for this quote/i.test(message);
+          showPaymentResult(c, { ok: false, quoteId: c.quoteId, code: declined ? "payment_declined" : "payment_outcome_unknown", retryable: false, note: declined ? "Wolt could not authorize the card payment. Review the attempt in Wolt before choosing another way to pay." : "The payment outcome could not be confirmed. Check your orders in Wolt before placing another order." }, true);
+        }
+      }
+    };
+    if (needsBrowser) {
+      pay.disabled = true;
+      status.textContent = "Open browser preparation once, then return here. This card detects when it is ready; you do not need to type Done.";
+      if (fallback) fallback.hidden = false;
+      watchBrowserPreparation();
+      return;
+    }
+    if (c.paymentContextReady) { ready(); return; }
+    if (!c.paymentSdkConfig) {
+      pay.disabled = false;
+      status.textContent = (c.paymentContextReady || !c.paymentContextUrl) ? "Ready. Confirm the total to place this order." : "Inline preparation is unavailable in this host. Open the fallback link once, then return to this card and confirm the total.";
+      if (fallback) fallback.hidden = !!c.paymentContextReady;
+      return;
+    }
+    pay.disabled = true;
+    status.textContent = "Preparing your saved card…";
+    (async function () {
+      try {
+        var rav = new Ravelin({ key: c.paymentSdkConfig.publicKey });
+        var deviceId = await Promise.race([rav.core.id(), new Promise(function (_, reject) { setTimeout(function () { reject(new Error("Device preparation timed out")); }, 12000); })]);
+        var value = await Promise.race([callTool("set_order_payment_context", { quote_id: c.quoteId, device_id: deviceId, browser_info: { color_depth: screen.colorDepth, java_enabled: navigator.javaEnabled ? navigator.javaEnabled() : false, language: navigator.language, screen_height: screen.height, screen_width: screen.width, time_zone_offset: new Date().getTimezoneOffset(), user_agent: navigator.userAgent } }), new Promise(function (_, reject) { setTimeout(function () { reject(new Error("Host did not confirm device preparation")); }, 15000); })]);
+        if (generation !== checkoutGeneration) return;
+        if (!value.ok) throw new Error("Could not prepare this quote");
+        pay.disabled = false;
+        status.textContent = "Ready. Confirm the total to place this order.";
+      } catch (e) {
+        if (generation !== checkoutGeneration) return;
+        // The external fallback saves context server-side. Keep this explicit
+        // confirmation usable after returning; place_order checks readiness.
+        pay.disabled = !c.paymentContextReady && !c.paymentContextUrl;
+        status.textContent = c.paymentContextReady ? "Using your recent browser preparation. Confirm the total to place this order." : "Inline preparation is unavailable. Open the fallback link once, then return to this card and confirm the total. You do not need to repeat setup for a refreshed quote.";
+        if (fallback) fallback.hidden = !!c.paymentContextReady;
+      }
+    })();
+  }
+  if (window.ResizeObserver) new ResizeObserver(function () {
+    notify("ui/notifications/size-changed", { height: document.documentElement.scrollHeight });
+  }).observe(document.body);
+
+  // ---- rendering
+  function esc(s) { return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]; }); }
+  function img(url, cls) {
+    if (!url) return '<div class="img ph ' + (cls || "") + '">🛒</div>';
+    var src = /imageproxy\.wolt\.com/.test(url) ? url + (url.indexOf("?") === -1 ? "?w=400" : "&w=400") : url;
+    return '<img class="img ' + (cls || "") + '" loading="lazy" alt="" src="' + esc(src) + '">';
+  }
+  var fmtCache = {};
+  function money(minor, currency) {
+    if (minor == null) return "";
+    var cur = currency || "EUR";
+    try {
+      var f = fmtCache[cur] || (fmtCache[cur] = new Intl.NumberFormat(hostContext.locale || navigator.language || "en", { style: "currency", currency: cur }));
+      var digits = f.resolvedOptions().maximumFractionDigits;
+      return f.format(minor / Math.pow(10, digits));
+    } catch (e) { return (minor / 100).toFixed(2) + " " + cur; }
+  }
+  function rating(score, volume) {
+    if (score == null) return "";
+    return '<span class="chip">★ ' + esc(score) + (volume ? ' <span class="muted">(' + esc(volume) + ')</span>' : "") + "</span>";
+  }
+  var actions = [];
+  function act(fn) { actions.push(fn); return actions.length - 1; }
+  root.addEventListener("click", function (ev) {
+    var b = ev.target.closest("[data-act]");
+    if (b) { ev.preventDefault(); var fn = actions[Number(b.getAttribute("data-act"))]; if (fn) fn(); }
+  });
+
+  function productCard(it, venue, currency) {
+    var vname = (venue && venue.name) || it.venueName || "";
+    var cur = it.currency || currency || (venue && venue.currency);
+    var add = act(function () { say("Add " + it.name + " (item " + it.itemId + ") from " + (vname || "this store") + " to my Wolt cart"); });
+    return '<div class="card">' + img(it.imageUrl) +
+      '<div class="body"><div class="name">' + esc(it.name) + '</div>' +
+      '<div class="price">' + money(it.price, cur) + (it.unitSize ? ' <span class="sub">' + esc(it.unitSize) + "</span>" : "") + "</div>" +
+      (vname ? '<div class="sub">' + esc(vname) + "</div>" : "") +
+      (it.isWeighted ? '<div class="chips"><span class="chip">by weight</span></div>' : "") +
+      '<div class="actions"><button class="primary" data-act="' + add + '">Add</button></div></div></div>';
+  }
+  function venueCard(v) {
+    var openIt = act(function () { say("Show me the menu of " + v.name + " (venue " + (v.slug || v.venueId) + ") on Wolt"); });
+    var fee = v.deliveryFeeFormatted || (v.deliveryFee != null ? money(v.deliveryFee, v.currency) : null);
+    return '<div class="card">' + img(v.imageUrl) +
+      '<div class="body"><div class="name">' + esc(v.name) + "</div>" +
+      '<div class="chips">' + rating(v.score != null ? v.score : v.rating, v.ratingVolume) +
+      (v.online === false ? '<span class="chip warn">closed</span>' : v.online ? '<span class="chip ok">open</span>' : "") +
+      (fee ? '<span class="chip">' + esc(fee) + " delivery</span>" : "") +
+      (v.estimateMinutes != null ? '<span class="chip">' + esc(v.estimateMinutes) + " min</span>" : v.estimate ? '<span class="chip">' + esc(v.estimate) + "</span>" : "") +
+      (v.woltPlus ? '<span class="chip">W+</span>' : "") + "</div>" +
+      (v.description ? '<div class="sub">' + esc(v.description) + "</div>" : v.address ? '<div class="sub">' + esc(v.address) + "</div>" : "") +
+      '<div class="actions"><button data-act="' + openIt + '">Menu</button></div></div></div>';
+  }
+  function section(title, inner) { return (title ? "<h2>" + esc(title) + "</h2>" : "") + inner; }
+
+  function render(data) {
+    if (!data || typeof data !== "object") return;
+    // Tool-call notifications can carry plain outcomes instead of a view.
+    // Route matching payment outcomes to the current card; background tool
+    // results must not replace checkout with a raw JSON block.
+    if (typeof data.view !== "string") {
+      if (activeCheckout && data.quoteId === activeCheckout.quoteId && typeof data.ok === "boolean") showPaymentResult(activeCheckout, data, true);
+      return;
+    }
+    activeCheckout = data.view === "checkout" && data.quoteId ? data : null;
+    try { root.innerHTML = draw(data); root.className = ""; rendered = true; if (data.view === "checkout" && data.quoteId) prepareCheckout(data); }
+    catch (e) {
+      // A drawing bug must not hide the result: fall back to the raw data.
+      root.className = "";
+      root.innerHTML = '<div class="note">Card error: ' + esc(e && e.message) + '</div><pre class="muted" style="white-space:pre-wrap">' + esc(JSON.stringify(data, null, 1)) + "</pre>";
+      rendered = true;
+    }
+  }
+  // One curated shortlist from the model (show_picks): the answer's own
+  // cards, with the photos the search results carried.
+  function pickCard(p) {
+    var add = p.itemId ? act(function () { say("Add " + p.name + " (item " + p.itemId + ")" + (p.venueName ? " from " + p.venueName : "") + " to my Wolt cart"); }) : null;
+    var openIt = p.url ? act(function () { open(p.url); }) : (p.venueSlug || p.venueName) ? act(function () { say("Show me the menu of " + (p.venueName || p.venueSlug) + (p.venueSlug ? " (venue " + p.venueSlug + ")" : "") + " on Wolt"); }) : null;
+    var price = p.priceText || (p.price != null ? money(p.price, p.currency) : "");
+    return '<div class="card">' + img(p.imageUrl) +
+      '<div class="body"><div class="name">' + esc(p.name) + "</div>" +
+      (p.venueName ? '<div class="sub">' + esc(p.venueName) + "</div>" : "") +
+      (p.description ? '<div class="sub" style="white-space:normal">' + esc(p.description) + "</div>" : "") +
+      '<div class="chips">' + (price ? '<span class="chip">' + esc(price) + "</span>" : "") + rating(p.rating) +
+      (p.eta ? '<span class="chip">' + esc(p.eta) + "</span>" : "") + "</div>" +
+      (add != null || openIt != null ? '<div class="actions">' + (add != null ? '<button class="primary" data-act="' + add + '">Add</button>' : "") +
+        (openIt != null ? '<button data-act="' + openIt + '">' + (p.url ? "Open in Wolt" : "Menu") + "</button>" : "") + "</div>" : "") + "</div></div>";
+  }
+  function draw(data) {
+    actions = [];
+    var html = "";
+    switch (data.view) {
+      case "picks": {
+        var picks = data.items || [];
+        html = section(data.title || "", '<div class="grid">' + picks.map(pickCard).join("") + "</div>") +
+          (data.note ? '<div class="note">' + esc(data.note) + "</div>" : "");
+        break;
+      }
+      case "products":
+      case "dishes": {
+        var items = data.items || data.dishes || [];
+        var venues = data.venues || {};
+        var venue = data.venue || null;
+        html = section((items.length ? items.length + " results" : "No results") + (data.query ? " for “" + data.query + "”" : "") + (venue ? " at " + venue.name : ""),
+          '<div class="grid">' + items.map(function (it) { return productCard(it, venue || venues[it.venueId], venue && venue.currency); }).join("") + "</div>");
+        if (data.languageNote) html += '<div class="note">' + esc(data.languageNote) + "</div>";
+        break;
+      }
+      case "menu": {
+        var mi = data.items || [];
+        html = section((data.totalItems != null ? data.totalItems + " items" : "Menu") + (data.venueSlug ? " · " + data.venueSlug : ""),
+          '<div class="grid">' + mi.map(function (it) { return productCard(it, null, data.currency); }).join("") + "</div>");
+        if (data.note) html += '<div class="note">' + esc(data.note) + "</div>";
+        break;
+      }
+      case "venues": {
+        var list = data.venues || [];
+        if (data.sections) {
+          html = data.sections.map(function (s) { return section(s.title, '<div class="grid">' + (s.venues || []).map(venueCard).join("") + "</div>"); }).join("");
+        } else {
+          html = section((data.matching != null ? data.matching + " of " + data.totalNearby + " venues" : list.length + " venues") + (data.query ? " for “" + data.query + "”" : ""),
+            '<div class="grid">' + list.map(venueCard).join("") + "</div>");
+        }
+        break;
+      }
+      case "venue": {
+        var v = data;
+        var menuAct = act(function () { say("Show me the menu of " + v.name + " (venue " + v.slug + ")"); });
+        html = (v.imageUrl ? img(v.imageUrl, "hero") : "") +
+          "<h2>" + esc(v.name) + "</h2>" +
+          '<div class="chips">' + rating(v.ratingScore != null ? v.ratingScore : v.rating, v.ratingVolume) +
+          (v.deliveryBasePrice != null ? '<span class="chip">' + money(v.deliveryBasePrice, v.currency) + " delivery</span>" : "") +
+          (v.catalogLanguage ? '<span class="chip">catalog: ' + esc(v.catalogLanguage) + "</span>" : "") + "</div>" +
+          (v.description ? '<p class="muted">' + esc(v.description) + "</p>" : "") +
+          (v.address ? '<div class="sub">' + esc(v.address) + "</div>" : "") +
+          (v.openingTimes && v.openingTimes.length ? '<table style="margin-top:8px">' + v.openingTimes.map(function (d) { return "<tr><td>" + esc(d.day) + "</td><td>" + esc(d.times) + "</td></tr>"; }).join("") + "</table>" : "") +
+          '<div class="actions"><button class="primary" data-act="' + menuAct + '">Menu</button>' +
+          (v.shareUrl ? '<button data-act="' + act(function () { open(v.shareUrl); }) + '">Open in Wolt</button>' : "") + "</div>";
+        break;
+      }
+      case "plan": {
+        var p = data, cur = (p.basket && p.basket.currency) || (p.venue && p.venue.currency);
+        var lines = p.lineItems || [];
+        var vn = p.venue ? (p.venue.name || p.venue.venueName) : null;
+        var write = act(function () { say("Looks good — add this planned cart" + (vn ? " at " + vn : "") + " to my Wolt basket"); });
+        html = "<h2>" + (vn ? esc(vn) : "Planned cart") + (p.coverage ? ' <span class="muted">' + esc(p.coverage) + " covered</span>" : "") + "</h2>" +
+          '<div class="list">' + lines.map(function (li) {
+            var alts = (li.alternatives || []).slice(0, 2).map(function (a) { return esc(a.name) + " " + money(a.price, cur); }).join(" · ");
+            return '<div class="card row">' + img(li.imageUrl) + '<div class="body"><div class="sub">' + esc(li.ingredient) + '</div><div class="name">' + esc(li.name) + "</div>" +
+              '<div class="chips"><span class="chip">' + money(li.price, cur) + "</span>" +
+              (li.confidence === "low" ? '<span class="chip warn">check</span>' : "") + "</div>" +
+              (alts ? '<div class="sub">or: ' + alts + "</div>" : "") + "</div></div>";
+          }).join("") + "</div>" +
+          (p.missing && p.missing.length ? '<div class="note">Missing: ' + esc(p.missing.join(", ")) + "</div>" : "") +
+          (p.evaluatedVenues ? '<div class="note">Also checked: ' + p.evaluatedVenues.map(function (e) { return esc(e.name) + " " + esc(e.coverage); }).join(", ") + "</div>" : "") +
+          (lines.length ? '<div class="actions"><button class="primary" data-act="' + write + '">Add all to cart</button></div>' : "");
+        break;
+      }
+      case "baskets": {
+        var bs = data.baskets || [];
+        html = bs.length ? bs.map(function (b) {
+          var total = (b.items || []).reduce(function (s, it) { return s + (it.price || 0) * (it.count || 1); }, 0);
+          var pay = act(function () { say("Preview the checkout for my basket at " + b.venueName); });
+          return "<h2>" + esc(b.venueName) + "</h2><table>" + (b.items || []).map(function (it) {
+            return "<tr><td>" + (it.imageUrl ? '<img class="img" style="width:36px;height:36px;aspect-ratio:1;border-radius:6px;display:inline-block;vertical-align:middle;margin-right:8px" src="' + esc(it.imageUrl + "?w=80") + '" alt="">' : "") +
+              esc(it.name) + ' <span class="muted">× ' + esc(it.count) + "</span></td><td>" + money((it.price || 0) * (it.count || 1), b.currency) + "</td></tr>";
+          }).join("") + '<tr class="total"><td>Items</td><td>' + money(total, b.currency) + "</td></tr></table>" +
+            '<div class="actions"><button class="primary" data-act="' + pay + '">Checkout preview</button></div>';
+        }).join("") : '<div class="muted">No baskets.</div>';
+        break;
+      }
+      case "checkout": {
+        // The same view draws checkout_preview and the order quote from
+        // prepare_order (quoteId present): the latter adds where it goes,
+        // what pays and the ETA, since the user is about to say yes to it.
+        var c = data, rows = (c.rows || []).filter(function (row) { return c.payableAmount == null || !row.isTotal; });
+        html = "<h2>" + (c.quoteId ? "Order quote" : "Checkout") + "</h2>" +
+          (c.quoteId ? '<div class="muted">' + [c.venue ? esc(c.venue) : "", c.deliveryTo ? "to " + esc(c.deliveryTo) : "", c.paidWith ? "card " + esc(c.paidWith) : "", c.eta ? "ETA " + esc(c.eta) : ""].filter(Boolean).join(" · ") + "</div>" : "") +
+          "<table>" + rows.map(function (r) { return "<tr><td>" + esc(r.label || r.name || r.type) + "</td><td>" + esc(r.formatted || money(r.amount, c.currency)) + "</td></tr>"; }).join("") +
+          (c.payableAmount != null ? '<tr class="total"><td>Total</td><td>' + esc(c.payableAmountFormatted || money(c.payableAmount, c.currency)) + "</td></tr>" : "") + "</table>" +
+          (c.checkoutUrl ? '<div class="actions"><button class="primary" data-act="' + act(function () { open(c.checkoutUrl); }) + '">Pay on Wolt</button></div>' : "") +
+          (c.warnings && c.warnings.length ? '<div class="note">' + esc(c.warnings.join(" ")) + "</div>" : "") +
+          (c.warning ? '<div class="note">' + esc(c.warning) + "</div>" : "") +
+          (c.quoteId ? '<div class="actions"><button id="confirm-pay" class="primary" disabled>Confirm and pay ' + esc(money(c.payableAmount, c.currency)) + '</button></div><div id="payment-status" class="note" role="status"></div>' : "") +
+          (c.paymentContextUrl ? '<div id="payment-fallback" class="actions" hidden><button data-act="' + act(function () { open(c.paymentContextUrl); }) + '">Open payment preparation</button></div>' : "") +
+          (c.deliveryDisclaimer ? '<div class="note">' + esc(c.deliveryDisclaimer) + '</div>' : "") +
+          (c.quoteId ? '<div class="note">Nothing is ordered until you confirm. Device data is sent to Ravelin for payment protection.</div>' : "");
+        break;
+      }
+      default:
+        html = '<pre class="muted" style="white-space:pre-wrap">' + esc(JSON.stringify(data, null, 1)) + "</pre>";
+    }
+    return html;
+  }
+
+  // ---- kick-off, after every declaration above exists: ChatGPT's data is
+  // already in window.openai when this runs, so the first render is now.
+  request("ui/initialize", { appInfo: { name: "wolt-mcp", version: "1" }, appCapabilities: {}, protocolVersion: PROTOCOL })
+    .then(function (res) { applyContext(res.hostContext || {}); notify("ui/notifications/initialized", {}); }).catch(function () { /* the compatibility bridge may still work */ });
+  window.addEventListener("openai:set_globals", fromOpenAI);
+  fromOpenAI();
+  // Poll for late data, and never leave a silent "Loading…": after a few
+  // seconds show one quiet line (the reply next to the card has the same
+  // facts), log what the host did and didn't send, and keep polling.
+  var polls = 0;
+  var poller = setInterval(function () {
+    if (rendered || ++polls > 60) return clearInterval(poller);
+    fromOpenAI();
+    if (!rendered && polls === 8) {
+      root.className = "muted";
+      root.textContent = "The card did not load here; the details are in the reply.";
+      try { console.warn("wolt-mcp card: no data from the host (" + globalsSummary() + ")"); } catch (e) {}
+    }
+  }, 500);
+})();
+</script>
+</body>
+</html>

@@ -5,7 +5,7 @@
   "type": "module",
   "license": "MIT",
   "bin": { "wolt-mcp": "server.mjs" },
-  "files": ["server.mjs", "lib/", "README.md"],
+  "files": ["server.mjs", "lib/", "ui/", "README.md"],
   "engines": { "node": ">=22" },
   "keywords": ["mcp", "modelcontextprotocol", "wolt", "grocery", "shopping", "cart", "delivery"],
   "author": "erlaufer",
@@ -14,12 +14,13 @@
   "bugs": { "url": "https://github.com/erlaufer/wolt-mcp/issues" },
   "scripts": {
     "start": "node server.mjs",
-    "test": "node ../test/recipe.test.mjs && node ../test/basket.test.mjs && node ../test/http.test.mjs && node ../test/lang.test.mjs && node ../test/match.test.mjs && node ../test/plan.test.mjs && node ../test/replay.test.mjs && node test/boot.test.mjs && node ../test/version.test.mjs",
+    "test": "node ../test/recipe.test.mjs && node ../test/basket.test.mjs && node ../test/http.test.mjs && node ../test/lang.test.mjs && node ../test/match.test.mjs && node ../test/search.test.mjs && node ../test/plan.test.mjs && node ../test/replay.test.mjs && node test/boot.test.mjs && node test/remote.test.mjs && node test/ui.test.mjs && node test/order.test.mjs && node test/payment-context.test.mjs && node test/payment-diagnostics.test.mjs && node ../test/version.test.mjs",
     "bench": "node ../test/bench.mjs",
     "timing": "node test/timing.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
+    "ravelinjs": "2.3.0",
     "zod": "^3.23.8"
   }
 }

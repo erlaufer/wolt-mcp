@@ -46,6 +46,8 @@ Searching stores needs no login — only basket writes do.
 
 **Account** — `get_wolt_profile`, `use_saved_address`, `get_order_history`, `get_order`, `get_payment_methods`, `get_favorites`, `add_favorite`, `remove_favorite`, `resolve_address`, `set_location`, `wolt_status`.
 
+**Ordering** (opt-in) — `prepare_order` quotes multiple quantities, dish options and products sold in grams. Compatible checkout cards prepare real browser information with the official Ravelin SDK and offer **Confirm and pay**, without a Done message. Embedded iPhone/iPad cards ask you to open browser preparation once when needed, then detect completion automatically. Device data is reusable for 30 minutes even if a price quote expires, and a new card does not replace existing preparation. Wolt's total includes any weight reserve; the final charge can change with the picked weight. `get_order_add_on_options` lists venues and the deadline for a second order at the same address; pass `parent_purchase_id` to `prepare_order`. Service fees and minimums may apply, and one courier is not guaranteed. Bank challenges must be completed in Wolt. A lost payment response is an unknown outcome: check Wolt before ordering again.
+
 ## Try it
 
 - *"Is my Wolt set up?"* → `wolt_status`

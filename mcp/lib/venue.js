@@ -7,6 +7,7 @@
 //     options[{id,name,type,values[{id,name,price}]}] }
 // Required option group: multi_choice_config.total_range.min > 0.
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { imageUrlOf } from "./ui.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { woltFetch } from "./http.js";
@@ -41,7 +42,7 @@ function cachePut(slug, venue) {
 export async function getVenue(slug) {
   const cached = cacheGet(slug);
   // Entries cached before shareUrl existed lack the field — refetch those.
-  if (cached && "shareUrl" in cached) return cached;
+  if (cached && "imageUrl" in cached) return cached;
   const r = await woltFetch(`${VENUE_STATIC_BASE}${slug}/static`, { auth: false });
   if (!r.ok) throw new Error(`venue fetch failed for "${slug}": HTTP ${r.status}`);
   const v = r.json?.venue || {};
@@ -51,6 +52,11 @@ export async function getVenue(slug) {
     name: v.name,
     description: v.description || null,
     rating: v.rating?.rating ?? v.rating ?? null,
+    // The public score (out of 10) and how many ratings it rests on; `rating`
+    // above is Wolt's coarse 0-3 bucket, kept for callers that sort on it.
+    ratingScore: v.rating?.score ?? null,
+    ratingVolume: v.rating?.volume ?? null,
+    imageUrl: v.image_url || imageUrlOf(v.listimage) || imageUrlOf(v.mainimage) || null,
     address: [v.address, v.city].filter(Boolean).join(", ") || null,
     country: v.country || null,
     currency: v.currency || null,
@@ -171,6 +177,7 @@ function normalizeMenuItem(it) {
     itemId: it.id,
     name: it.name,
     price: it.price ?? null,
+    imageUrl: imageUrlOf(it.images) || imageUrlOf(it.image) || null,
     description: it.description || null,
     optionGroups: groups.length,
     requiredOptions: groups.some((g) => (g.multi_choice_config?.total_range?.min ?? 0) > 0),

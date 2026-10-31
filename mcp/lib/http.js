@@ -55,10 +55,16 @@ function retryAfterMs(res) {
   return Number.isFinite(at) ? Math.min(Math.max(at - Date.now(), 0), MAX_RETRY_AFTER_MS) : null;
 }
 
-// Returns { ok, status, json, text }. Throws only on missing-token (with the
+// Returns { ok, status, json, text, requestIds }. Only allowlisted response
+// correlation IDs are retained; cookies and arbitrary headers never are.
+// Throws only on missing-token (with the
 // user-facing setup guidance from auth.js) or network-level failure.
+// auth: true needs a token; false never sends one; "optional" sends one when
+// the account is connected and goes anonymous otherwise — for pages Wolt
+// serves to everyone but personalises for a logged-in user (the front page,
+// venue search).
 // retry429Ms is injectable so tests don't sleep through real backoffs.
-export async function woltFetch(url, { method = "GET", body = null, lang = "en", auth = true, fetchImpl = null, retry429Ms = RETRY_429_MS } = {}) {
+export async function woltFetch(url, { method = "GET", body = null, lang = "en", auth = true, fetchImpl = null, retry429Ms = RETRY_429_MS, retry = true } = {}) {
   const impl = fetchImpl || injectedFetch || fetch;
   const doFetch = async (token) => {
     await acquire();
@@ -71,11 +77,20 @@ export async function woltFetch(url, { method = "GET", body = null, lang = "en",
     } finally { inFlight--; }
   };
 
-  let token = auth ? await getAccessToken() : null;
+  const optional = auth === "optional";
+  let token = null;
+  if (auth === true) token = await getAccessToken();
+  else if (optional) { try { token = await getAccessToken(); } catch (e) { token = null; } }
   let res = await doFetch(token);
 
-  if (auth && res.status === 401) {
-    token = await refreshAccessToken(); // throws with paste guidance if the chain is dead
+  if (retry && token && res.status === 401) {
+    if (optional) {
+      // A stale optional token is not worth failing over: refresh if we can,
+      // otherwise serve the public version of the page.
+      try { token = await refreshAccessToken(); } catch (e) { token = null; }
+    } else {
+      token = await refreshAccessToken(); // throws with paste guidance if the chain is dead
+    }
     res = await doFetch(token);
   }
 
@@ -83,7 +98,7 @@ export async function woltFetch(url, { method = "GET", body = null, lang = "en",
   // the default ladder. Past that, the honest failure beats silent waiting.
   let honoredRetryAfter = false;
   let attempt429 = 0;
-  while (res.status === 429 || res.status >= 500) {
+  while (retry && (res.status === 429 || res.status >= 500)) {
     const ra = retryAfterMs(res);
     let wait = null;
     if (ra != null && !honoredRetryAfter) { wait = ra; honoredRetryAfter = true; }
@@ -102,5 +117,10 @@ export async function woltFetch(url, { method = "GET", body = null, lang = "en",
   const text = await res.text();
   let json = null;
   try { json = JSON.parse(text); } catch (e) {}
-  return { ok: res.ok, status: res.status, json, text };
+  const requestIds = {};
+  for (const name of ["x-request-id", "x-correlation-id", "x-wolt-request-id", "x-amzn-requestid", "x-amz-cf-id", "cf-ray"]) {
+    const value = res.headers.get(name);
+    if (typeof value === "string" && /^[A-Za-z0-9_.:/+=-]{1,256}$/.test(value)) requestIds[name] = value;
+  }
+  return { ok: res.ok, status: res.status, json, text, requestIds };
 }

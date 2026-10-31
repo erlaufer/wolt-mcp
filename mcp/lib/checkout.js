@@ -5,11 +5,16 @@
 // resolve it from the venue's assortment (and per-item venue pages as a
 // fallback); as a last resort we fall back to the item id itself, which
 // the endpoint accepts.
+//
+// loadBasketPlan() is the shared first half — basket, venue, currency and the
+// priced menu_items — used by the preview here and by the order quote in
+// order.js, so the two always price the same lines the same way.
 import { woltFetch } from "./http.js";
 import { BASKETS_PAGE_URL, findBasketForVenue, resolveCurrency } from "./wolt.js";
 import { getVenue } from "./venue.js";
+import { orderWeight, itemAmount } from "./weight.js";
 
-const CHECKOUT_URL = "https://consumer-api.wolt.com/order-xp/web/v2/pages/checkout";
+export const CHECKOUT_URL = "https://consumer-api.wolt.com/order-xp/web/v2/pages/checkout";
 const ASSORTMENT_BASE = "https://consumer-api.wolt.com/consumer-api/consumer-assortment/v1/venues/slug/";
 const VENUE_ITEM_BASE = "https://consumer-api.wolt.com/order-xp/web/v1/pages/venue/";
 
@@ -44,9 +49,10 @@ async function tryFetchJson(url, opts) {
   } catch (e) { return null; }
 }
 
-// Preview checkout for the user's existing basket at one venue.
-// Returns { payableAmount, rows, deliveryConfigs, offers, warnings, raw }.
-export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, country = null, tip = 0, promoCode = null }) {
+// The user's basket at one venue, priced the way the checkout endpoint wants
+// it. Returns { basket, venue, venueId, slug, currency, country, menuItems,
+// lines, warnings }; throws when there is no basket or the market is unknown.
+export async function loadBasketPlan({ venueId, venueSlug = null, lat, lon, country = null }) {
   const warnings = [];
   const pageRes = await woltFetch(`${BASKETS_PAGE_URL}?lat=${lat}&lon=${lon}`);
   if (!pageRes.ok) throw new Error(`baskets fetch failed: HTTP ${pageRes.status}`);
@@ -84,6 +90,24 @@ export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, cou
     warnings.push("no venue slug available — category mapping limited to per-item lookups");
   }
 
+  // Big venues (the grocery markets) list categories without their items, so
+  // the assortment index misses them. The item records call the website uses
+  // returns each item's categories alongside; ask it for whatever is left.
+  const itemCategories = new Map();
+  const weightCatalog = new Map();
+  const unresolved = (basket.items || []).filter((l) => l.id && (!categoryIndex.has(l.id) || l.weighted_item_info)).map((l) => l.id);
+  if (slug && unresolved.length) {
+    const recs = await tryFetchJson(`${ASSORTMENT_BASE}${slug}/assortment/items`, { method: "POST", body: { item_ids: unresolved }, auth: false });
+    for (const it of recs?.items || []) weightCatalog.set(it.id, it);
+    for (const c of recs?.categories || []) {
+      for (const id of c.item_ids || []) {
+        if (!itemCategories.has(id)) itemCategories.set(id, []);
+        itemCategories.get(id).push(c.id);
+      }
+    }
+    for (const [id, cats] of itemCategories) if (!categoryIndex.has(id)) categoryIndex.set(id, cats[0]);
+  }
+
   const menuItems = [];
   for (const line of basket.items || []) {
     const count = line.count > 0 ? line.count : 1;
@@ -98,15 +122,16 @@ export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, cou
       if (isObjectId(line.id)) { categoryId = line.id; warnings.push(`category_id unresolved for ${line.name || line.id}; using item id`); }
       else throw new Error(`cannot resolve category_id for basket item ${line.id}`);
     }
+    const weighted = line.weighted_item_info ? orderWeight(line, weightCatalog.get(line.id)) : null;
     menuItems.push({
       id: line.id,
       venue_id: resolvedVenueId,
-      count,
+      count: weighted ? 1 : count,
       base_price: price,
-      end_amount: count * price,
-      is_weighted_item: !!line.weighted_item_info,
+      end_amount: itemAmount(price, count, weighted),
+      ...(weighted ? { weighted } : {}),
       category_id: categoryId,
-      category_ids: [categoryId],
+      category_ids: itemCategories.get(line.id) || [categoryId],
       alcohol_permille: line.alcohol_permille || 0,
       exclude_from_credits: !!line.exclude_from_credits,
       exclude_from_discounts: !!line.exclude_from_discounts,
@@ -119,12 +144,32 @@ export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, cou
       }))
     });
   }
+  return { basket, venue, venueId: resolvedVenueId, slug, currency, country: venueCountry.toUpperCase(), menuItems, lines: basket.items || [], warnings };
+}
 
+// Rows of a checkout page, flattened to { label, amount, formatted }.
+export function checkoutRows(j) {
+  return (j.checkout_rows || []).map((row) => {
+    // observed live: row.amount is { amount, formatted_amount, reason }
+    const a = row.amount_row?.amount ?? row.price_total_amount_row?.amount ?? row.price_total_amount ?? row.amount;
+    return {
+      label: row.label || row.title || null,
+      amount: typeof a === "number" ? a : a?.amount ?? null,
+      formatted: a?.formatted_amount ?? null,
+      ...(row.template === "price_total_amount_row" || row.price_total_amount != null || row.price_total_amount_row != null ? { isTotal: true } : {})
+    };
+  }).filter((r) => r.label || r.amount != null);
+}
+
+// Preview checkout for the user's existing basket at one venue.
+// Returns { payableAmount, rows, deliveryConfigs, offers, warnings, raw }.
+export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, country = null, tip = 0, promoCode = null }) {
+  const plan = await loadBasketPlan({ venueId, venueSlug, lat, lon, country });
   const payload = {
     purchase_plan: {
-      venue: { id: resolvedVenueId, currency, country: venueCountry.toUpperCase() },
+      venue: { id: plan.venueId, currency: plan.currency, country: plan.country },
       delivery_method: "homedelivery",
-      menu_items: menuItems,
+      menu_items: plan.menuItems,
       use_promo_discount_ids: promoCode ? [promoCode] : [],
       courier_tip: tip,
       use_cash: false,
@@ -142,20 +187,12 @@ export async function checkoutPreview({ venueId, venueSlug = null, lat, lon, cou
   const j = r.json || {};
   return {
     payableAmount: j.payable_amount ?? null,
-    currency,
-    rows: (j.checkout_rows || []).map((row) => {
-      // observed live: row.amount is { amount, formatted_amount, reason }
-      const a = row.amount_row?.amount ?? row.price_total_amount_row?.amount ?? row.amount;
-      return {
-        label: row.label || row.title || null,
-        amount: typeof a === "number" ? a : a?.amount ?? null,
-        formatted: a?.formatted_amount ?? null
-      };
-    }).filter((r) => r.label || r.amount != null),
+    currency: plan.currency,
+    rows: checkoutRows(j),
     deliveryConfigs: j.delivery_configs ?? null,
     offers: j.offers ?? null,
     tipConfig: j.tip_config ?? null,
-    warnings,
+    warnings: plan.warnings,
     raw: j
   };
 }
