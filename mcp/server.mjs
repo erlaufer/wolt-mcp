@@ -545,11 +545,11 @@ server.tool(
 // --- get_order_history / get_order: enables "reorder my usual" ---
 server.tool(
   "get_order_history",
-  "The user's past Wolt orders (needs a token): venue, date, total, status, purchase_id. Use get_order for line items — together these enable 'order my usual again'.",
-  { limit: z.number().int().default(10), skip: z.number().int().default(0) },
-  async ({ limit, skip }) => {
+  "The user's past Wolt orders: venue, date, total, status and purchase_id. Page size is 1–100. For the next page pass nextPageToken as page_token; skip is a legacy offset (0–1000), never combine it with page_token. Use get_order for line items or payment status; get_baskets is not order history. Needs login.",
+  { limit: z.number().int().min(1).max(100).nullish().default(10), skip: z.number().int().min(0).max(1000).nullish().default(0), page_token: z.string().min(1).nullish().describe("nextPageToken from the previous response; omit for the first page") },
+  async ({ limit, skip, page_token }) => {
     try {
-      const j = await getOrderHistory({ limit, skip });
+      const j = await getOrderHistory({ limit, skip, pageToken: page_token });
       const orders = (j.orders || []).map((o) => ({
         purchaseId: o.purchase_id, venue: o.venue_name, receivedAt: o.received_at,
         status: o.status, total: o.total_amount, active: o.is_active
